@@ -1,0 +1,1430 @@
+// ==UserScript==
+// @name         超星通用课程截止提醒
+// @namespace    chaoxing-deadline
+// @version      2.6.2
+// @description  通用课程和课程都读取：只列出还没截止的作业和考试，另列出未结课且章节没看完的课程
+// @match        https://mooc1-2.chaoxing.com/visit/courses*
+// @match        https://mooc1-2.chaoxing.com/mooc-ans/visit/courses*
+// @match        https://mooc1.chaoxing.com/visit/courses*
+// @match        https://mooc1-2.chaoxing.com/visit/interaction*
+// @match        https://mooc1-2.chaoxing.com/mooc-ans/visit/interaction*
+// @match        https://mooc1.chaoxing.com/visit/interaction*
+// @match        https://*.chaoxing.com/wfw/courselist/course3*
+// @match        https://*.chaoxing.com/fyportal/courselist/course3*
+// @match        https://*.chaoxing.com/courselist/course3*
+// @connect      v24.chaoxing.com
+// @connect      mooc1-2.chaoxing.com
+// @connect      mooc1-3.chaoxing.com
+// @connect      mooc1-4.chaoxing.com
+// @connect      mooc1.chaoxing.com
+// @connect      mooc2-ans.chaoxing.com
+// @connect      passport2.chaoxing.com
+// @connect      i.mooc.chaoxing.com
+// @connect      mobilelearn.chaoxing.com
+// @connect      fycourse.fanya.chaoxing.com
+// @connect      fyportal.chaoxing.com
+// @grant        GM_xmlhttpRequest
+// @grant        GM_addStyle
+// @run-at       document-idle
+// ==/UserScript==
+
+(function () {
+  'use strict';
+
+  const SEVEN_DAYS = 7 * 24 * 60 * 60 * 1000;
+  // 单个请求的超时。20 秒太长：一旦有几个请求卡住，光超时就够把整轮拖到一分钟以上，
+  // 而超时的请求本来也要走重试/换域名。12 秒足够正常页面返回，卡住的早点放弃更快。
+  const FETCH_TIMEOUT = 12000;
+  // v2.2.0 提速参数
+  // 已知安全域名（mooc1-2 / mooc2-ans）的请求发起间隔。实测这两个域名
+  // 承接 170+ 个请求全部 200，180ms（约 5.5 req/s）是安全余量。
+  // 被反爬命中时这个间隔会自动 ×3 退避，必要时可手动调大。
+  const FAST_GAP = 180;
+  // mooc1 及未知域名的间隔，保守一些（mooc1 本身是指纹型拒绝，限速也拦不住它）
+  const SLOW_GAP = 1500;
+  // 同时处理几门课。并发数决定流水线深度：并发够大时耗时只受“域名发起间隔”约束，
+  // 不会随网络变慢而线性膨胀（仿真：43 门课在 200~800ms 延迟下都是 23~25 秒）。
+  // 并发变多不会提高对服务器的瞬时压力——同域名的请求发起间隔仍是 180ms，
+  // 并发只影响“同时在途”的连接数。
+  const CONCURRENCY_FAST = 20;
+  // 全局在途请求上限。
+  // 实测超星一次请求要 1.8~4.1 秒（章节页 100~500KB），在途上限就等于吞吐上限：
+  // 20 个在途 / 4 秒 = 只有 5 请求/秒，147 个请求要 29.5 秒（v2.6.1 实测）。
+  // 提到 26 之后，最坏情况（冷连接 4 秒）约 22 秒，常见情况（1.5 秒）约 11 秒。
+  // 注意每个域名的请求发起间隔仍是 180ms，单机总请求量不变（每台约 39 个，远低于反爬阈值）。
+  const MAX_INFLIGHT = 26;
+  // 命中反爬后的退避：间隔 ×3（上限 6 秒）+ 该域名本轮弃用
+  const MAX_HOST_GAP = 6000;
+
+  GM_addStyle(`
+    #cx-deadline {
+      position: fixed;
+      top: 72px;
+      right: 18px;
+      z-index: 2147483646;
+      width: 640px;
+      max-width: calc(100vw - 16px);
+      background: #fff;
+      color: #1f2937;
+      border: 1px solid #e5e7eb;
+      border-radius: 8px;
+      box-shadow: 0 8px 24px rgba(15, 23, 42, 0.16);
+      font: 12px/1.3 "Microsoft YaHei", "PingFang SC", sans-serif;
+      overflow: hidden;
+    }
+    #cx-deadline.is-min { width: 280px; }
+    #cx-deadline .cx-bar {
+      height: 30px;
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      padding: 0 6px 0 8px;
+      background: #1e3a5f;
+      color: #fff;
+      cursor: move;
+      user-select: none;
+      touch-action: none;
+    }
+    #cx-deadline .cx-title { flex: 1; font-weight: 600; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+    #cx-deadline .cx-bar button {
+      border: 0;
+      background: transparent;
+      color: #fff;
+      width: 22px;
+      height: 22px;
+      border-radius: 4px;
+      cursor: pointer;
+      font-size: 14px;
+      line-height: 22px;
+    }
+    #cx-deadline .cx-bar button:hover { background: rgba(255,255,255,.16); }
+    #cx-deadline .cx-bar button.cx-scanbtn { width: auto; padding: 0 9px; font-size: 12px; font-weight: 600; }
+    #cx-deadline .cx-bar button.cx-scanbtn:disabled { opacity: .6; cursor: default; background: transparent; }
+    #cx-deadline .cx-start { padding: 20px 12px; text-align: center; }
+    #cx-deadline .cx-start button {
+      border: 0; background: #1e3a5f; color: #fff; padding: 8px 20px; border-radius: 6px;
+      font: 600 13px/1.2 "Microsoft YaHei", "PingFang SC", sans-serif; cursor: pointer;
+    }
+    #cx-deadline .cx-start button:hover { background: #2b5480; }
+    #cx-deadline .cx-start p { margin: 9px 0 0; color: #64748b; font-size: 11px; line-height: 1.5; }
+    #cx-deadline .cx-body { max-height: 420px; overflow: auto; background: #fff; display: flex; align-items: flex-start; }
+    #cx-deadline .cx-col { width: 50%; min-width: 0; max-height: 420px; overflow: auto; }
+    #cx-deadline .cx-col + .cx-col { border-left: 1px solid #e5e7eb; }
+    #cx-deadline .cx-sec { padding: 4px 8px; background: #f8fafc; color: #1e3a5f; font-weight: 650; border-bottom: 1px solid #e5e7eb; }
+    #cx-deadline table { width: 100%; border-collapse: collapse; }
+    #cx-deadline th, #cx-deadline td {
+      padding: 3px 6px;
+      text-align: left;
+      border-bottom: 1px solid #f1f5f9;
+      vertical-align: top;
+    }
+    #cx-deadline th { position: sticky; top: 0; background: #f8fafc; color: #64748b; font-weight: 600; }
+    #cx-deadline td.cx-name { width: 34%; }
+    #cx-deadline td.cx-work { width: 40%; }
+    #cx-deadline tr.cx-hot td { color: #dc2626; font-weight: 650; background: #fff5f5; }
+    #cx-deadline tr.cx-ok td { color: #15803d; background: #f0fdf4; }
+    #cx-deadline tr.cx-done td { color: #15803d; font-weight: 650; background: #f0fdf4; }
+    #cx-deadline .cx-kind { color: #64748b; font-weight: 500; margin-right: 4px; }
+    #cx-deadline tr.cx-hot .cx-kind { color: #dc2626; }
+    #cx-deadline tr.cx-ok .cx-kind,
+    #cx-deadline tr.cx-done .cx-kind { color: #15803d; }
+    #cx-deadline .cx-status { display: block; color: #94a3b8; font-size: 11px; font-weight: 400; }
+    #cx-deadline tr.cx-hot .cx-status { color: #f87171; }
+    #cx-deadline tr.cx-done .cx-status { color: #16a34a; }
+    #cx-deadline .cx-foot { padding: 4px 8px; color: #64748b; background: #f8fafc; font-size: 11px; }
+    #cx-deadline .cx-log {
+      max-height: 190px; overflow: auto; background: #0f172a; color: #cbd5e1;
+      font: 11px/1.45 Consolas, Menlo, monospace; padding: 6px 8px; word-break: break-all;
+    }
+    #cx-deadline.is-min .cx-log { display: none !important; }
+    #cx-deadline .cx-empty { padding: 12px 8px; text-align: center; color: #64748b; }
+  `);
+
+  const panel = document.createElement('div');
+  panel.id = 'cx-deadline';
+  panel.innerHTML = `
+    <div class="cx-bar">
+      <div class="cx-title">通用课程截止</div>
+      <button type="button" data-act="scan" class="cx-scanbtn" title="开始扫描（手动触发）">▶ 扫描</button>
+      <button type="button" data-act="log" title="查看读取日志">☰</button>
+      <button type="button" data-act="min" title="最小化">—</button>
+    </div>
+    <div class="cx-body"></div>
+    <div class="cx-log" style="display:none"></div>
+    <div class="cx-foot">把鼠标按在上方蓝条上可拖动</div>
+  `;
+  document.documentElement.appendChild(panel);
+
+  const titleEl = panel.querySelector('.cx-title');
+  const bodyEl = panel.querySelector('.cx-body');
+  const footEl = panel.querySelector('.cx-foot');
+  const logEl = panel.querySelector('.cx-log');
+  const minBtn = panel.querySelector('[data-act="min"]');
+  const logBtn = panel.querySelector('[data-act="log"]');
+  const scanBtn = panel.querySelector('[data-act="scan"]');
+  const VERSION = '2.6.2';
+  let logLines = [];
+
+  function log(msg) {
+    logLines.push(new Date().toTimeString().slice(0, 8) + ' ' + msg);
+    if (logLines.length > 200) logLines.shift();
+    if (logEl.style.display !== 'none') renderLog();
+  }
+
+  function renderLog() {
+    logEl.innerHTML = logLines.length
+      ? logLines.map(function (l) { return '<div>' + escapeHtml(l) + '</div>'; }).join('')
+      : '<div style="color:#94a3b8">暂无日志</div>';
+  }
+
+  logBtn.addEventListener('click', function (e) {
+    e.stopPropagation();
+    const show = logEl.style.display === 'none';
+    logEl.style.display = show ? '' : 'none';
+    if (show) renderLog();
+  });
+  let rows = [];
+  let chapterRows = [];
+  let minimized = false;
+  let loading = false;
+
+  function setMinimized(next) {
+    minimized = next;
+    panel.classList.toggle('is-min', minimized);
+    bodyEl.style.display = minimized ? 'none' : '';
+    footEl.style.display = minimized ? 'none' : '';
+    minBtn.textContent = minimized ? '□' : '—';
+    minBtn.title = minimized ? '还原' : '最小化';
+  }
+
+  minBtn.addEventListener('click', function (e) {
+    e.stopPropagation();
+    setMinimized(!minimized);
+  });
+  // 扫描完全手动触发：刷新页面、切学期筛选都不会自动发请求，只有点按钮才扫。
+  function setScanBtn(text, disabled) {
+    scanBtn.textContent = text;
+    scanBtn.disabled = !!disabled;
+  }
+
+  function renderIdle() {
+    titleEl.textContent = '点击「▶ 扫描」开始';
+    bodyEl.innerHTML = '<div class="cx-start">'
+      + '<button type="button" data-act="start">▶ 开始扫描</button>'
+      + '<p>只读取当前页面可见的课程（课程页按当前学期筛选）<br>读取作业、考试截止时间与未看完的章节</p></div>';
+    const b = bodyEl.querySelector('[data-act="start"]');
+    if (b) b.addEventListener('click', function (e) { e.stopPropagation(); startScan(); });
+  }
+
+  function startScan() {
+    if (loading) return;
+    setScanBtn('⟳ 扫描中', true);
+    scan();
+  }
+
+  scanBtn.addEventListener('click', function (e) {
+    e.stopPropagation();
+    startScan();
+  });
+
+  let dragging = false;
+  let offsetX = 0;
+  let offsetY = 0;
+  panel.querySelector('.cx-bar').addEventListener('mousedown', function (e) {
+    if (e.button !== 0 || e.target.closest('button')) return;
+    const rect = panel.getBoundingClientRect();
+    dragging = true;
+    offsetX = e.clientX - rect.left;
+    offsetY = e.clientY - rect.top;
+    panel.style.right = 'auto';
+    panel.style.left = rect.left + 'px';
+    panel.style.top = rect.top + 'px';
+    e.preventDefault();
+  });
+  document.addEventListener('mousemove', function (e) {
+    if (!dragging) return;
+    const maxL = Math.max(0, window.innerWidth - panel.offsetWidth);
+    const maxT = Math.max(0, window.innerHeight - 38);
+    const left = Math.min(maxL, Math.max(0, e.clientX - offsetX));
+    const top = Math.min(maxT, Math.max(0, e.clientY - offsetY));
+    panel.style.left = left + 'px';
+    panel.style.top = top + 'px';
+  });
+  document.addEventListener('mouseup', function () { dragging = false; });
+
+  function headerValue(res, name) {
+    const raw = res.responseHeaders || '';
+    const m = raw.match(new RegExp('^' + name + ':\\s*(.+)$', 'im'));
+    return m ? m[1].trim() : '';
+  }
+
+  function absoluteUrl(base, loc) {
+    try { return new URL(loc, base).href; } catch (e) { return loc; }
+  }
+
+  function redirectInHtml(text) {
+    if (!text || text.length > 8000) return '';
+    const meta = text.match(/http-equiv=["']?refresh["']?[^>]*url=([^"'>\s]+)/i);
+    if (meta) return meta[1];
+    const js = text.match(/(?:window\.)?location(?:\.href)?\s*=\s*["']([^"']+)["']/i);
+    return js ? js[1] : '';
+  }
+
+  // 超星的反爬验证页：命中时说明请求被判为异常（多为频率过高）。
+  function isAntispider(page, pageUrl, status) {
+    return /antispiderShowVerify/i.test(pageUrl || '')
+      || (status === 202 && /提示页面|antispider/i.test(page))
+      || /antispider/i.test(page);
+  }
+
+  function sleep(ms) {
+    return new Promise(function (r) { setTimeout(r, ms); });
+  }
+
+  // ---------------- 按域名的请求限速 + 反爬熔断 ----------------
+  // v2.1.0 用的是「全局串行队列 + 700ms 间隔」，172 个请求要 2~3 分钟。
+  // 实测证明反爬是「指纹型」而不是「频率型」：
+  //   · 课程页扫描的第 1 个请求（开始后 1 秒）就吃了 202 antispider，
+  //     说明 mooc1 是无条件拒绝脚本的请求形态，限速根本拦不住它；
+  //   · 而 mooc1-2 / mooc2-ans 承接 170+ 个请求全部 status=200。
+  // 所以改成：按域名分别限速（限的是“发起时刻”的间隔），不同域名互不等待，
+  // 再叠加课程级并发。172 个请求摊下来 ~24 秒。
+  const hostState = {};
+  let inflightTotal = 0;
+  const slotWaiters = [];
+
+  // 各域名的请求计数：日志里能直接看出负载摊到了哪几台机器上，
+  // 以及某个域名是不是被打满了（逼近反爬的累计量阈值）。
+  const hostHits = {};
+  let totalHits = 0;
+  // GM_xmlhttpRequest 会自己跟完 302：门户请求实际落到了 mooc2-ans，
+  // 但那一跳没经过 hostRequest —— 既没限速也没计数。
+  // 实测证据：一轮扫描 mooc2-ans 只记到 34 次（正好等于章节数），
+  // 说明门户那一跳整个是「隐身」的，几十个门户同时砸过去 = 一批没有间隔的突发流量。
+  const landHits = {};
+  // 门户请求实际落到的域名（只认门户这一类，别让作业/考试的跳转把预占目标带偏）
+  let portalLandHost = '';
+
+  function resetHits() {
+    Object.keys(hostHits).forEach(function (k) { delete hostHits[k]; });
+    Object.keys(landHits).forEach(function (k) { delete landHits[k]; });
+    portalLandHost = '';
+    totalHits = 0;
+  }
+
+  // 只占位、不发请求：在某个域名上按它的间隔排一个队。
+  // 目前保留给「需要把某类请求在某个域名上摊开」的场景使用。
+  async function reserveSlot(host) {
+    if (!host) return;
+    const st = stOf(host);
+    const now0 = Date.now();
+    const startAt = Math.max(st.nextAt, now0);
+    st.nextAt = startAt + st.gap;
+    const gapWait = startAt - now0;
+    if (gapWait > 0) await sleep(gapWait);
+  }
+
+  function hostOf(url) {
+    try { return new URL(String(url)).hostname; } catch (e) { return ''; }
+  }
+
+  // 快速域名：mooc1-2 / mooc1-3 / mooc1-4（数据与门户） + mooc2-ans（章节与门户落点）。
+  // 这四个是实测没被反爬拦过的，间隔可以压到 180ms；mooc1 及未知域名用慢速间隔。
+  function isFastHost(host) {
+    return /(^|\.)mooc1-2\.chaoxing\.com$/.test(host || '')
+      || /(^|\.)mooc1-3\.chaoxing\.com$/.test(host || '')
+      || /(^|\.)mooc1-4\.chaoxing\.com$/.test(host || '')
+      || /(^|\.)mooc2-ans\.chaoxing\.com$/.test(host || '');
+  }
+
+  function stOf(host) {
+    if (!hostState[host]) {
+      hostState[host] = {
+        gap: isFastHost(host) ? FAST_GAP : SLOW_GAP,
+        nextAt: 0
+      };
+    }
+    return hostState[host];
+  }
+
+  // 命中反爬：整轮弃用该域名。
+  // 关键是「不设冷却」——冷却会把所有已经排在这个域名队列里的请求一起卡住，
+  // 整轮扫描会被拖成 1 分钟（实测 58.6 秒）。正确做法是：
+  // 已排队的请求立刻失败并顺延到下一个宿主，剩余流量自动转移。
+  function penalize(host) {
+    if (!host) return;
+    const h = /:\/\//.test(host) ? hostOf(host) : host;
+    if (!h) return;
+    const st = stOf(h);
+    st.gap = Math.min(MAX_HOST_GAP, Math.round(st.gap * 3));
+    if (!bannedHost[h]) {
+      bannedHost[h] = true;
+      log('域名 ' + h + ' 本轮弃用，后续请求改走其它宿主');
+    }
+  }
+
+  function resetBans() {
+    Object.keys(bannedHost).forEach(function (k) { delete bannedHost[k]; });
+    Object.keys(badDataHost).forEach(function (k) { delete badDataHost[k]; });
+    // 退避后的间隔也一并还原：新一轮扫描是全新的开始
+    Object.keys(hostState).forEach(function (k) {
+      const st = hostState[k];
+      st.gap = isFastHost(k) ? FAST_GAP : SLOW_GAP;
+      st.nextAt = 0;
+    });
+  }
+
+  async function acquireSlot() {
+    if (inflightTotal < MAX_INFLIGHT) {
+      inflightTotal++;
+      return;
+    }
+    await new Promise(function (r) { slotWaiters.push(r); });
+    inflightTotal++;
+  }
+
+  function releaseSlot() {
+    inflightTotal--;
+    const w = slotWaiters.shift();
+    if (w) w();
+  }
+
+  // 发起时刻间隔：同步预占一个时间片，避免并发调用挤在同一毫秒上。
+  async function hostRequest(host, fn) {
+    if (bannedHost[host]) throw new Error(host + ' 本轮已弃用');
+    hostHits[host] = (hostHits[host] || 0) + 1;
+    totalHits += 1;
+    const st = stOf(host);
+    const now0 = Date.now();
+    const startAt = Math.max(st.nextAt, now0);
+    st.nextAt = startAt + st.gap;
+    const gapWait = startAt - now0;
+    if (gapWait > 0) await sleep(gapWait);
+    // 等待期间这个域名可能已经被弃用（命中反爬），立刻失败并顺延到下一个宿主，
+    // 而不是把请求白发给一个必然被拦的域名。
+    if (bannedHost[host]) throw new Error(host + ' 本轮已弃用');
+    await acquireSlot();
+    try {
+      return await fn();
+    } finally {
+      releaseSlot();
+    }
+  }
+
+  // 带浏览器特征头请求，降低被超星判为爬虫的概率。
+  function browserHeaders(url) {
+    let host = '';
+    try { host = new URL(url).hostname; } catch (e) { host = ''; }
+    return {
+      'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
+      'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8',
+      'Referer': 'https://' + host + '/',
+      'Sec-Fetch-Dest': 'document',
+      'Sec-Fetch-Mode': 'navigate',
+      'Sec-Fetch-Site': 'same-origin',
+      'Upgrade-Insecure-Requests': '1'
+    };
+  }
+
+  // 真正的单次请求（不做限速、不做冷却判断，由 httpOnce 统一调度）。
+  // 302 跳转的每一跳也要按“落点域名”限速：门户请求是
+  // mooc1-2 → mooc2-ans 的两跳，如果落点不限速，mooc2-ans 会收到
+  // 一批没被间隔约束的突发流量。
+  function rawRequest(url, hops) {
+    return new Promise(function (resolve, reject) {
+      GM_xmlhttpRequest({
+        method: 'GET',
+        url: String(url),
+        timeout: FETCH_TIMEOUT,
+        anonymous: false,
+        headers: browserHeaders(url),
+        onload: function (res) {
+          const landed = res.finalUrl || String(url);
+          const loc = headerValue(res, 'location');
+          const text = res.responseText || '';
+          if (res.status >= 300 && res.status < 400 && loc && (hops || 0) < 6) {
+            const next = absoluteUrl(landed, loc);
+            hostRequest(hostOf(next), function () { return rawRequest(next, (hops || 0) + 1); }).then(resolve, reject);
+            return;
+          }
+          const jump = redirectInHtml(text);
+          if (jump && (hops || 0) < 6) {
+            const next = absoluteUrl(landed, jump);
+            hostRequest(hostOf(next), function () { return rawRequest(next, (hops || 0) + 1); }).then(resolve, reject);
+            return;
+          }
+          // 走到这里说明 GM 自己把 302 跟完了：响应是落点域名发出来的，
+          // 但那一跳没经过 hostRequest（既没限速也没计数）。
+          // 记下落点，后面同类请求先在它上面占个位置，把突发流量摊平。
+          const reqHost = hostOf(url);
+          const landHost = hostOf(landed);
+          if (landHost && reqHost && landHost !== reqHost) {
+            landHits[landHost] = (landHits[landHost] || 0) + 1;
+          }
+          resolve({
+            text: text,
+            url: landed,
+            status: res.status,
+            antispider: isAntispider(text, landed, res.status)
+          });
+        },
+        onerror: function () { reject(new Error('网络错误')); },
+        ontimeout: function () { reject(new Error('超时')); }
+      });
+    });
+  }
+
+  // 对外入口：按域名限速 + 冷却；命中反爬时把“最终落点域名”拉黑退避。
+  // 关键点：课程页卡片链接 /courselist/opencoursenewfy 会 302 到 mooc1.chaoxing.com，
+  // 而 mooc1 对脚本请求有反爬，所以必须把最终落点（mooc1）而不是请求域名拉黑。
+  async function httpOnce(url, hops) {
+    const host = hostOf(url);
+    const res = await hostRequest(host, function () { return rawRequest(url, hops); });
+    if (res.antispider) {
+      const served = hostOf(res.url);
+      // 把反爬页的前 120 个字打出来：到底是谁吐出了反爬页、是不是误判，一眼可见
+      const snippet = String(res.text || '').replace(/\s+/g, ' ').slice(0, 120);
+      log('⚠ 命中反爬：发出方=' + host + ' 吐出方=' + served + ' status=' + res.status
+        + ' 正文前120字=' + snippet);
+      penalize(served);
+    }
+    return res;
+  }
+
+  function isLoginPage(page, pageUrl) {
+    return /passport2\.chaoxing\.com/.test(pageUrl || '')
+      || /<title>\s*用户登录\s*<\/title>/i.test(page)
+      || /id="loginBtn"/.test(page);
+  }
+
+  // 取课程门户参数：enc / t / workEnc / examEnc / cpi / moocDomainName。
+  // 课程门户的 stu 页把这些值放在隐藏域里，地址栏也带 enc 与 t。
+  // issuerHost 是「发起这次门户请求的域名」，不是最终落点：
+  // 门户页是 302 落到 mooc2-ans 的，但 mooc2-ans 没有 /mooc2/work/list 这条路由（404），
+  // 作业和考试必须回到发起方（mooc1-2/3/4）去读。
+  function readCourseParams(page, pageUrl, issuerHost) {
+    const enc = field(page, 'enc') || queryParam(pageUrl, 'enc') || queryParam(pageUrl, 'stuenc');
+    const t = field(page, 't') || queryParam(pageUrl, 't');
+    return {
+      enc: enc,
+      t: t,
+      oldenc: field(page, 'oldenc'),
+      workEnc: field(page, 'workEnc'),
+      examEnc: field(page, 'examEnc'),
+      cpi: field(page, 'cpi') || queryParam(pageUrl, 'cpi'),
+      domain: field(page, 'moocDomainName') || 'https://mooc1.chaoxing.com',
+      host: issuerHost ? 'https://' + issuerHost
+        : (hostOf(pageUrl) ? 'https://' + hostOf(pageUrl) : ''),
+      landHost: hostOf(pageUrl) || ''
+    };
+  }
+
+  // 课程门户新版页同时具备 workEnc/examEnc 隐藏域，才算真的进了课程。
+  function hasPortalFields(p) {
+    return !!(p.enc && p.t && (p.workEnc || p.examEnc));
+  }
+
+  // 课程门户的候选入口，按可靠性排序。
+  //
+  // 实测（2026-10-19 / 2026-10-21 用户日志 + 浏览器验证）：
+  //  · 课程页（v24/wfw/courselist/course3）的卡片链接是相对路径 /courselist/opencoursenewfy，
+  //    它会 302 到 mooc1.chaoxing.com —— 而 mooc1 对脚本请求有反爬，返回 202 antispiderShowVerify。
+  //    于是 enc/t/workEnc/examEnc 一个都拿不到，后面作业/考试的多域名回退根本轮不到执行。
+  //  · 通用课程页的卡片链接本身就是 stucoursemiddle，直落 mooc2-ans 门户，可以直接用。
+  //  · stucoursemiddle 必须带 ismooc2=1 才会进新版门户（否则落旧版页，没有 t）。
+  //  · mooc1-2.chaoxing.com 上 stucoursemiddle 路由存在且不受反爬影响（浏览器实测：
+  //    https://mooc1-2.chaoxing.com/visit/stucoursemiddle?courseid=204567725&clazzid=106500144&ismooc2=1
+  //    → https://mooc2-ans.chaoxing.com/mooc2-ans/mycourse/stu?...&enc=73ea...&t=1792416940012）
+  //
+  // 所以课程页必须改走 mooc1-2 的 stucoursemiddle，opencoursenewfy 只作最后兜底。
+  function portalCandidates(course, step) {
+    const q = 'courseid=' + encodeURIComponent(course.courseId)
+      + '&clazzid=' + encodeURIComponent(course.classId)
+      + '&cpi=' + encodeURIComponent(course.cpi || '');
+    const href = course.href || '';
+    // opencoursenewfy / courselist 形式的卡片链接最终会落到 mooc1，先不放在最前面。
+    const cardIsOpenCourse = /opencoursenewfy/.test(href) || /\/courselist\//.test(href);
+    // 卡片链接本身就是 stucoursemiddle 时（通用课程页），mooc1-2/3/4 的 mids 是同一条路由，
+    // 只是换了宿主。所以把卡片链接的域名换成轮换出来的宿主、参数（vc=1 等）原样保留，
+    // 这样既能把门户请求摊到 3 台机器上，又保持用户实测过的那条 URL 形态。
+    // 自定义域名（学校自己的 mooc 域）不在此列——那种情况卡片链接必须排第一。
+    const cardIsMiddle = /stucoursemiddle/.test(href);
+    const cardIsChaoxing = /(^|\.)chaoxing\.com$/.test(hostOf(href));
+    const list = [];
+    // mooc1-2 / mooc1-3 / mooc1-4 都支持 stucoursemiddle，是门户参数的三个可用宿主，
+    // 按课程序号轮换起点：单主机只承担 1/3 的请求量，既快又不容易触发累计量阈值。
+    const mids = rotateHosts([
+      { family: 'mid2', url: 'https://mooc1-2.chaoxing.com/visit/stucoursemiddle?' + q + '&ismooc2=1' },
+      { family: 'mid3', url: 'https://mooc1-3.chaoxing.com/visit/stucoursemiddle?' + q + '&ismooc2=1' },
+      { family: 'mid4', url: 'https://mooc1-4.chaoxing.com/visit/stucoursemiddle?' + q + '&ismooc2=1' }
+    ], step || 0);
+    if (cardIsMiddle && cardIsChaoxing) {
+      const cardUrl = withIsmooc2(href);
+      const path = cardUrl.replace(/^https?:\/\/[^/]+/, '');
+      mids.forEach(function (m) {
+        list.push({ family: m.family, url: 'https://' + hostOf(m.url) + path });
+      });
+      // 卡片链接本身可能就等于某个 mid（例如卡片在 mooc1-2、而本轮起点也是 mooc1-2），
+      // 重复的候选只会白白发一次请求，这里去掉。
+      if (!list.some(function (c) { return c.url === cardUrl; })) {
+        list.push({ family: 'card', url: cardUrl });
+      }
+    } else {
+      if (href && !cardIsOpenCourse) {
+        list.push({ family: 'card', url: withIsmooc2(href) });
+      }
+      list.push.apply(list, mids);
+      if (href && cardIsOpenCourse) {
+        list.push({ family: 'card', url: href });
+      }
+    }
+    list.push({
+      family: 'mid1',
+      url: 'https://mooc1.chaoxing.com/visit/stucoursemiddle?' + q + '&ismooc2=1'
+    });
+    // 已被反爬整轮弃用的域名直接剔除；全被剔除就解除弃用重新开始
+    const usable = list.filter(function (c) { return !isBanned(hostOf(c.url)); });
+    if (!usable.length) {
+      log('所有门户入口都已弃用，解除弃用重新开始');
+      resetBans();
+      return list;
+    }
+    return usable;
+  }
+
+  // 通用课程页的卡片链接需要补 ismooc2=1 才进新版门户。
+  function withIsmooc2(href) {
+    if (/stucoursemiddle/.test(href) && !/ismooc2=1/.test(href)) {
+      return href + (href.indexOf('?') >= 0 ? '&' : '?') + 'ismooc2=1';
+    }
+    return href;
+  }
+
+  // 超星的错误页（non-existent）与登录页都要单独识别，避免误报参数缺失。
+  function isErrorPage(page) {
+    return /<title>\s*non-existent\s*<\/title>/i.test(page)
+      || /error-page\/css\/style\.css/i.test(page);
+  }
+
+  // 超星的「提示」页（title=提示、正文很短）：这个域名上没有这门课的数据。
+  // 它不是错误信号：绝大多数课程本来就没有作业/考试，服务器就回这个页面。
+  function isHintPage(page) {
+    const title = (String(page).match(/<title>([^<]*)<\/title>/i) || [])[1] || '';
+    return /^\s*提示\s*$/.test(title) && String(page).length < 5000;
+  }
+
+  // 抓取数据页（作业/考试/章节）。带候选域名回退。
+  // buildUrl(domain) 由调用方给出对应域名的完整地址。
+  //
+  // 「提示」页（title=提示、正文很短）不是错误，而是「这个域名上没有这门课的数据」。
+  // 实测（2026-10-20）：大多数课程本来就没有作业/考试，服务器就是返回提示页。
+  // 旧逻辑把它当失败，换域名再试 + 整轮再重试一次 —— 光是最后落到 mooc1 的那几十次
+  // 白等（1.5 秒一次），一轮扫描就被拖到 89 秒。
+  //
+  // 现在的判定：发起方（签发 workEnc/examEnc 的那个域名）说「没有数据」，那就是没有数据，
+  // 直接返回空结果，不再换域名、不进重试轮 —— 这一条是提速的关键。
+  // 只有当请求发到的是兜底域名时，才值得再换一个快宿主试试。
+  async function fetchData(buildUrl, label, domains, opts) {
+    opts = opts || {};
+    const list = domains || [null];
+    const hintLimit = opts.hintLimit == null ? 2 : opts.hintLimit;
+    const primary = opts.primaryHost || '';
+    let last = '请求失败';
+    let hints = 0;
+    for (let d = 0; d < list.length; d++) {
+      const dom = list[d];
+      const url = buildUrl(dom);
+      for (let attempt = 1; attempt <= 2; attempt++) {
+        let got;
+        const t0 = Date.now();
+        try {
+          got = await httpOnce(url, 0);
+        } catch (e) {
+          last = e && e.message ? e.message : '请求失败';
+          log(label + '[' + dom + '] 请求异常: ' + last + '（' + (Date.now() - t0) + 'ms）');
+          break;
+        }
+        const cost = Date.now() - t0;
+        if (got.antispider) {
+          last = '被超星反爬拦截';
+          log(label + '[' + dom + '] 命中超星反爬，换域名重试（' + cost + 'ms）');
+          await sleep(300);
+          break;
+        }
+        if (isLoginPage(got.text, got.url)) {
+          last = '登录已失效';
+          log(label + '[' + dom + '] 跳登录页，换域名重试');
+          break;
+        }
+        // 4xx/5xx 是「这个域名没有这条路由」，不是「这门课没有作业」。
+        // 以前把它当成功，404 页面被解析成 0 条，作业/考试会静默全灭。
+        if (got.status >= 400) {
+          last = 'HTTP ' + got.status;
+          log(label + '[' + dom + '] HTTP ' + got.status + '（这个域名没有这条路由），换域名重试（'
+            + cost + 'ms）');
+          break;
+        }
+        if (isErrorPage(got.text)) {
+          last = '超星错误页';
+          log(label + '[' + dom + '] 超星错误页（non-existent），换域名重试');
+          break;
+        }
+        if (isHintPage(got.text)) {
+          hints += 1;
+          const isPrimary = !!(primary && dom === primary);
+          log(label + '[' + dom + '] 返回「提示」页：这个域名上没有这门课的数据（' + cost + 'ms）'
+            + (isPrimary ? '（发起方域名，确认无数据）' : ''));
+          if (isPrimary || hints >= hintLimit) {
+            log(label + ' 判定：确实没有数据，不再换域名、也不再重试');
+            return { text: '', url: got.url, status: got.status, empty: true };
+          }
+          break;
+        }
+        const title = (String(got.text).match(/<title>([^<]*)<\/title>/i) || [])[1] || '(无title)';
+        log(label + '[' + dom + '] status=' + got.status + ' len=' + String(got.text).length
+          + ' title=' + title + '（' + cost + 'ms）');
+        return got;
+      }
+    }
+    // 候选域名都用完了，但至少有一个回了「提示」页：说明确实没有数据，不是失败
+    if (hints > 0) {
+      log(label + ' 判定：确实没有数据（不再重试）');
+      return { text: '', url: '', status: 0, empty: true };
+    }
+    throw new Error(last);
+  }
+
+  // 某一类入口一旦整体命中反爬，本轮扫描就不再用它（避免 40 多门课各撞一次）。
+  // 按“入口页路径 + 入口类型”分桶：课程页的卡片链接被判反爬，
+  // 不应该影响到通用课程页那张本来好用的卡片链接。
+  const badEntry = {};
+  const pageKey = location.pathname;
+
+  // 依次尝试候选入口，直到拿到完整课程门户参数。
+  // step 是课程序号：门户入口必须按它轮换宿主，否则门户请求会全部压到 mooc1-2 上。
+  async function openPortal(course, step) {
+    const cands = portalCandidates(course, step);
+    let sawLogin = false;
+    let last = '没有拿到课程参数';
+    log('[' + course.name + '] 开始，候选入口 ' + cands.length + ' 个');
+    for (let i = 0; i < cands.length; i++) {
+      const cand = cands[i];
+      const key = pageKey + '|' + cand.family;
+      if (badEntry[key]) {
+        log('[' + course.name + '] 跳过入口' + (i + 1) + '（' + cand.family + ' 本轮已被反爬标记）');
+        continue;
+      }
+      let got;
+      try {
+        got = await httpOnce(cand.url, 0);
+      } catch (e) {
+        last = e && e.message ? e.message : '请求失败';
+        log('[' + course.name + '] 入口' + (i + 1) + '(' + cand.family + ') 请求异常: ' + last);
+        continue;
+      }
+      // 这一跳是 GM 内部跟的：落点域名不受限速，记下来便于排查
+      const landHost = hostOf(got.url);
+      if (landHost && landHost !== hostOf(cand.url)) {
+        portalLandHost = landHost;
+        log('[' + course.name + '] 入口' + (i + 1) + '(' + cand.family + ') 实际落点=' + landHost
+          + '（这一跳是 GM 内部跟的，不受本脚本限速）');
+      }
+      const title = (String(got.text).match(/<title>([^<]*)<\/title>/i) || [])[1] || '(无title)';
+      const len = String(got.text).length;
+      log('[' + course.name + '] 入口' + (i + 1) + '(' + cand.family + ') status=' + got.status
+        + ' len=' + len + ' title=' + title + ' 最终URL=' + String(got.url).slice(0, 150));
+      if (got.antispider) {
+        last = '被超星反爬拦截';
+        // 卡片链接（opencoursenewfy）会整体落到 mooc1，一旦被拦就整轮弃用这一类入口。
+        if (cand.family === 'card') badEntry[key] = true;
+        log('[' + course.name + '] 入口' + (i + 1) + '(' + cand.family + ') 判定=反爬拦截'
+          + (cand.family === 'card' ? '，本轮不再使用卡片链接' : ''));
+        await sleep(300);
+        continue;
+      }
+      if (isLoginPage(got.text, got.url)) {
+        sawLogin = true;
+        last = '登录已失效';
+        log('[' + course.name + '] 入口' + (i + 1) + '(' + cand.family + ') 判定=登录页');
+        continue;
+      }
+      if (isErrorPage(got.text)) {
+        last = '课程入口已失效';
+        log('[' + course.name + '] 入口' + (i + 1) + '(' + cand.family + ') 判定=超星错误页');
+        continue;
+      }
+      if (isHintPage(got.text)) {
+        last = '入口返回提示页';
+        log('[' + course.name + '] 入口' + (i + 1) + '(' + cand.family + ') 判定=「提示」页，换下一个入口');
+        continue;
+      }
+      const p = readCourseParams(got.text, got.url, hostOf(cand.url));
+      log('[' + course.name + '] 入口' + (i + 1) + '(' + cand.family + ') 取到 enc=' + (p.enc || '(空)')
+        + ' t=' + (p.t || '(空)') + ' workEnc=' + (p.workEnc ? '有' : '(空)')
+        + ' examEnc=' + (p.examEnc ? '有' : '(空)') + ' cpi=' + (p.cpi || '(空)')
+        + ' 发起域名=' + (p.host || '(空)') + ' 落点=' + (p.landHost || '(空)'));
+      if (hasPortalFields(p)) {
+        log('[' + course.name + '] 入口' + (i + 1) + '(' + cand.family + ') 成功');
+        return p;
+      }
+      last = '没有拿到课程参数';
+      log('[' + course.name + '] 入口' + (i + 1) + '(' + cand.family + ') 判定=参数不全');
+    }
+    throw new Error(last || (sawLogin ? '登录已失效' : '没有拿到课程参数'));
+  }
+
+  function queryParam(url, name) {
+    const m = String(url || '').match(new RegExp('[?&]' + name + '=([^&#]+)'));
+    return m ? decodeURIComponent(m[1]) : '';
+  }
+
+  function field(html, id) {
+    const patterns = [
+      new RegExp('id="' + id + '"[^>]*value="([^"]*)"', 'ig'),
+      new RegExp('value="([^"]*)"[^>]*id="' + id + '"', 'ig'),
+      new RegExp("id='" + id + "'[^>]*value='([^']*)'", 'ig'),
+      new RegExp("value='([^']*)'[^>]*id='" + id + "'", 'ig')
+    ];
+    for (let i = 0; i < patterns.length; i++) {
+      let m;
+      while ((m = patterns[i].exec(html))) {
+        if (m[1]) return decode(m[1]);
+      }
+    }
+    return '';
+  }
+
+  function decode(s) {
+    const t = document.createElement('textarea');
+    t.innerHTML = s;
+    return t.value;
+  }
+
+  function escapeHtml(s) {
+    return String(s == null ? '' : s)
+      .replace(/&/g, '&amp;')
+      .replace(/</g, '&lt;')
+      .replace(/>/g, '&gt;')
+      .replace(/"/g, '&quot;');
+  }
+
+  // 探测页面上真实存在的课程容器与卡片选择器，避免选择器猜错导致整页 0 门。
+  function probePage() {
+    const hits = [];
+    ['#courseList', '#courselistArea', 'li.w_couritem', '#stuCourseList', 'li.courseItem', 'li.course-item']
+      .forEach(function (sel) {
+        const n = document.querySelectorAll(sel).length;
+        hits.push(sel + '=' + n);
+      });
+    log('选择器探测: ' + hits.join(' '));
+    const area = document.querySelector('#courselistArea') || document.querySelector('#stuCourseList');
+    if (area) {
+      const kids = area.querySelectorAll('li, .course-item');
+      log('容器 ' + (area.id || area.className) + ' 下子项 ' + kids.length + ' 个');
+      if (kids.length) {
+        const one = kids[0];
+        log('首个卡片 class="' + (one.className || '') + '" 文本='
+          + String(one.innerText || '').replace(/\s+/g, ' ').slice(0, 80));
+        const a = one.querySelector('a[href]');
+        if (a) log('首个卡片链接: ' + String(a.getAttribute('href')).slice(0, 180));
+      }
+    }
+  }
+
+  // 通用课程页（/visit/courses）卡片结构（实测）：
+  //   li.courseItem > input[name=courseId] / input[name=classId]
+  //                > a.courseName[title=课程名][href=stucoursemiddle?courseid=&clazzid=&cpi=]
+  function parseCommonCourses() {
+    const out = [];
+    document.querySelectorAll('li.courseItem').forEach(function (li) {
+      const courseId = (li.querySelector('input[name="courseId"]') || {}).value || '';
+      const classId = (li.querySelector('input[name="classId"]') || {}).value || '';
+      const nameEl = li.querySelector('a.courseName, h3 a[title]');
+      const name = ((nameEl && (nameEl.getAttribute('title') || nameEl.textContent)) || '').trim();
+      const a = li.querySelector('a.courseName') || li.querySelector('a[href*="stucoursemiddle"]');
+      const href = (a && a.href) || '';
+      if (!courseId || !classId || !name) {
+        log('通用课程卡片缺参数 courseId=' + courseId + ' classId=' + classId + ' name=' + name);
+        return;
+      }
+      const cpi = (href.match(/[?&]cpi=(\d+)/) || [])[1] || '';
+      const cardText = (li.innerText || '').replace(/\s+/g, '');
+      out.push(courseItem(name, courseId, classId, cpi, href, cardText, detectEnded(cardText, li)));
+    });
+    return out;
+  }
+
+  function coursesFromPage() {
+    const list = [];
+    // 通用课程（/visit/courses）
+    list.push.apply(list, parseCommonCourses());
+    // 兼容旧版通用课程页的选择器
+    document.querySelectorAll('#courseList li.course').forEach(function (li) {
+      const a = li.querySelector('a.color1, a[href*="courseid="]');
+      if (!a) return;
+      const href = a.href || '';
+      const courseId = (href.match(/[?&](?:courseid|courseId)=(\d+)/) || [])[1];
+      const classId = (href.match(/[?&](?:clazzid|clazzId)=(\d+)/) || [])[1];
+      const cpi = (href.match(/[?&]cpi=(\d+)/) || [])[1];
+      const nameEl = li.querySelector('.course-name, .courseName, [title]');
+      const name = ((nameEl && (nameEl.getAttribute('title') || nameEl.textContent)) || '').trim();
+      if (!courseId || !classId || !name) return;
+      const cardText = (li.innerText || '').replace(/\s+/g, '');
+      list.push(courseItem(name, courseId, classId, cpi, href, cardText, detectEnded(cardText, li)));
+    });
+    // 课程（/wfw/courselist/course3）
+    document.querySelectorAll('li.w_couritem').forEach(function (li) {
+      const courseId = li.getAttribute('cid');
+      const classId = li.getAttribute('classid');
+      const cpi = li.getAttribute('personid') || '';
+      const name = (li.getAttribute('cname') || '').trim();
+      const a = li.querySelector('a[href*="opencoursenewfy"]');
+      if (!courseId || !classId || !name || !a) return;
+      if (!isShown(li)) return;
+      const cardText = (li.innerText || '').replace(/\s+/g, '');
+      list.push(courseItem(name, courseId, classId, cpi, a.href, cardText, detectEnded(cardText, li)));
+    });
+    return list;
+  }
+
+  function isShown(el) {
+    let n = el;
+    while (n && n.nodeType === 1) {
+      const st = window.getComputedStyle(n);
+      if (st.display === 'none' || st.visibility === 'hidden') return false;
+      n = n.parentElement;
+    }
+    return true;
+  }
+
+  // 卡片上的结课标记。通用课程页用文字「已开启结课模式」，课程页用 state=1 / .not-open-tip。
+  function detectEnded(cardText, el) {
+    const t = String(cardText || '');
+    if (/已开启结课模式|已结课|已结束/.test(t)) return true;
+    if (el) {
+      if (el.getAttribute && el.getAttribute('state') === '1') return true;
+      if (el.querySelector && el.querySelector('.not-open-tip')) return true;
+    }
+    return false;
+  }
+
+  // 课程起止时间。实测有两种写法：
+  //   开课时间：2026-03-02~2027-02-20
+  //   课程时间：2026年10月12日-2028年10月12日
+  function parseTermEnd(cardText) {
+    const t = String(cardText || '');
+    const iso = t.match(/(\d{4})-(\d{1,2})-(\d{1,2})\s*[～~—\-–至到]\s*(\d{4})-(\d{1,2})-(\d{1,2})/);
+    if (iso) {
+      const end = new Date(iso[4] + '/' + iso[5] + '/' + iso[6] + ' 23:59:59').getTime();
+      return isNaN(end) ? null : end;
+    }
+    const cn = t.match(/(\d{4})年(\d{1,2})月(\d{1,2})日\s*[～~—\-–至到]\s*(\d{4})年(\d{1,2})月(\d{1,2})日/);
+    if (cn) {
+      const end = new Date(cn[4] + '/' + cn[5] + '/' + cn[6] + ' 23:59:59').getTime();
+      return isNaN(end) ? null : end;
+    }
+    return null;
+  }
+
+  function courseItem(name, courseId, classId, cpi, href, cardText, ended) {
+    const endMs = ended ? 0 : parseTermEnd(cardText);
+    return { name: name, courseId: courseId, classId: classId, cpi: cpi || '', href: href, endMs: endMs, ended: !!ended };
+  }
+
+  function parseDeadline(text, now) {
+    const t = String(text || '').replace(/\s+/g, '');
+    if (!t) return null;
+    if (/已结束|已截止|已过期/.test(t)) return now - 60000;
+    let ms = 0;
+    let hit = false;
+    const day = t.match(/(\d+)天/);
+    const hour = t.match(/(\d+)小时/);
+    const min = t.match(/(\d+)分/);
+    if (day || hour || min) {
+      hit = true;
+      if (day) ms += Number(day[1]) * 86400000;
+      if (hour) ms += Number(hour[1]) * 3600000;
+      if (min) ms += Number(min[1]) * 60000;
+    }
+    if (hit && /剩余|还剩/.test(t)) return now + ms;
+    const dates = t.match(/20\d{2}-\d{2}-\d{2}\d{2}:\d{2}/g) || text.match(/20\d{2}-\d{2}-\d{2}[ T]\d{2}:\d{2}/g);
+    if (dates && dates.length) {
+      const last = dates[dates.length - 1].replace(/(\d{4}-\d{2}-\d{2})(\d{2}:)/, '$1 $2').replace(/-/g, '/');
+      const ts = new Date(last).getTime();
+      if (!isNaN(ts)) return ts;
+    }
+    return null;
+  }
+
+  function parseTasks(html, courseName, kind, now) {
+    const out = [];
+    let doc = null;
+    try { doc = new DOMParser().parseFromString(html, 'text/html'); } catch (e) { doc = null; }
+    if (doc) doc.querySelectorAll('.bottomList li, .task-list li').forEach(function (li) {
+      const name = ((li.querySelector('.overHidden2') || {}).textContent || '').trim();
+      const status = ((li.querySelector('.status') || {}).textContent || '').replace(/\s+/g, '');
+      const timeText = ((li.querySelector('.time') || {}).textContent || '').replace(/\s+/g, '');
+      if (!name) return;
+      const settled = /待批阅|待批改|已完成|已批阅/.test(status);
+      const deadline = parseDeadline(timeText, now);
+      if (deadline == null || deadline <= now) return;
+      out.push({
+        course: courseName,
+        work: name,
+        kind: kind,
+        status: status,
+        settled: settled,
+        deadline: deadline
+      });
+    });
+    if (out.length || !/剩余|还剩/.test(html)) return out;
+    html.split(/<li\b/i).slice(1).forEach(function (part) {
+      const name = textOf(part.match(/class="overHidden2[^"]*"[^>]*>([\s\S]*?)<\/p>/i));
+      const status = textOf(part.match(/class="status[^"]*"[^>]*>([\s\S]*?)<\/p>/i)).replace(/\s+/g, '');
+      const timeText = textOf(part.match(/class="time[^"]*"[^>]*>([\s\S]*?)<\/div>/i)).replace(/\s+/g, '');
+      if (!name) return;
+      const settled = /待批阅|待批改|已完成|已批阅/.test(status);
+      const deadline = parseDeadline(timeText, now);
+      if (deadline == null || deadline <= now) return;
+      out.push({ course: courseName, work: name, kind: kind, status: status, settled: settled, deadline: deadline });
+    });
+    return out;
+  }
+
+  function textOf(match) {
+    return match ? decode(match[1].replace(/<[^>]+>/g, '')).trim() : '';
+  }
+
+  // 章节页结构：.chapter_item > .catalog_title > .catalog_task，
+  // 未完成时是 .catalog_jindu > .catalog_points_yi(数字)，完成时是 .catalog_state。
+  function parseChapters(html) {
+    const doc = new DOMParser().parseFromString(html, 'text/html');
+    const out = [];
+    doc.querySelectorAll('.chapter_item').forEach(function (item) {
+      const task = item.querySelector('.catalog_task');
+      if (!task) return;
+      if (task.querySelector('.catalog_state')) return;
+      const numEl = task.querySelector('.catalog_points_yi');
+      const pending = parseInt(((numEl && numEl.textContent) || '').trim(), 10);
+      if (!pending || isNaN(pending)) return;
+      const title = (item.getAttribute('title') || '').trim();
+      const sbar = ((item.querySelector('.catalog_sbar') || {}).textContent || '').trim();
+      const name = ((sbar ? sbar + ' ' : '') + title).trim();
+      if (!name) return;
+      out.push({ name: name, pending: pending });
+    });
+    return out;
+  }
+
+  // 三个“快宿主”轮转分摊请求。
+  // 实测：单一主力时 mooc1-2 要扛 129 个请求（23.5 秒）且会被超星按累计量拦下；
+  // 按课程序号轮换起点后，每个宿主只承担约 43 个（15.5 秒），既更快也更安全。
+  // 同一门课的门户/作业/考试落在同一个宿主上（用同一个课程序号），保持一致性。
+  const FAST_DATA_HOSTS = [
+    'https://mooc1-2.chaoxing.com',
+    'https://mooc1-3.chaoxing.com',
+    'https://mooc1-4.chaoxing.com'
+  ];
+
+  function rotateHosts(list, step) {
+    const n = list.length;
+    if (!n) return list.slice();
+    const r = ((step % n) + n) % n;
+    return list.slice(r).concat(list.slice(0, r));
+  }
+
+  // 被反爬命中的域名，本轮扫描整体弃用（不是只冷却 10 秒）。
+  // 原因：超星拦的其实是「单个域名的累计请求量」——通用课程页 102 个请求打在
+  // mooc1-2 上没事，紧接着的课程页扫描 129 个就被拦了。命中后继续用它，
+  // 后面几十门课会连环失败；整轮弃用能让剩下的流量自动转移到下一个宿主。
+  const bannedHost = {};
+
+  function isBanned(host) {
+    return !!bannedHost[host];
+  }
+
+  // 某个域名连续多次返回「提示」页，说明它压根不提供这个学校/这个班级的数据，
+  // 本轮扫描就不再用它了（否则每门课都要白费一次请求）。
+  const badDataHost = {};
+
+  function markDataHostBad(domain) {
+    if (!domain) return;
+    badDataHost[domain] = (badDataHost[domain] || 0) + 1;
+    if (badDataHost[domain] >= 3) {
+      log('数据域名 ' + domain + ' 连续 ' + badDataHost[domain] + ' 次返回提示页，本轮弃用');
+    }
+  }
+
+  // 作业/考试列表的候选域名。实测（2026-10-19/21）：
+  // mooc1.chaoxing.com 对脚本请求有反爬，返回 202 antispiderShowVerify（指纹型拒绝，限速也防不住）；
+  // mooc1-2 / mooc1-3 / mooc1-4 承载同一套数据且都不受该反爬影响（路由探测：四个域名的
+  // /visit/stucoursemiddle、/mooc2/work/list、/exam-ans/mooc2/exam/exam-list 全部 302 跳登录=存在；
+  // mooc1-5 不存在）。所以四个宿主轮着当主力，某个被限流时自动切到下一个，
+  // 不会像只有 mooc1-2 + mooc1 那样“一被拦就彻底没退路”。
+  function dataDomains(domain, step, portalHost) {
+    const all = [];
+    // 门户参数（enc / t / workEnc / examEnc）是从哪个域名拿到的，作业和考试就优先用那个域名。
+    // 同一门课的数据是按分片存放的：换到别的域名去读同一门课，服务器只会回一个「提示」页。
+    if (portalHost && all.indexOf(portalHost) < 0) all.push(portalHost);
+    rotateHosts(FAST_DATA_HOSTS, step || 0).forEach(function (d) {
+      if (all.indexOf(d) < 0) all.push(d);
+    });
+    [domain, 'https://mooc1.chaoxing.com'].forEach(function (d) {
+      if (d && all.indexOf(d) < 0) all.push(d);
+    });
+    const list = all.filter(function (d) { return !badDataHost[d] && !isBanned(hostOf(d)); });
+    // 全被弃用/拉黑了就等于没得选了：解除弃用，重新从主力开始，
+    // 宁可慢，也不能把这门课的数据整个丢掉。
+    if (!list.length) {
+      log('所有数据域名都已弃用，解除弃用重新开始');
+      resetBans();
+      return all;
+    }
+    return list;
+  }
+
+  // 三个数据页地址。参数组合与浏览器实测通过的请求一致。
+  function workListUrl(domain, c, p, cpi) {
+    return domain + '/mooc2/work/list?courseId=' + encodeURIComponent(c.courseId)
+      + '&classId=' + encodeURIComponent(c.classId)
+      + '&cpi=' + encodeURIComponent(cpi)
+      + '&ut=s&t=' + encodeURIComponent(p.t)
+      + '&stuenc=' + encodeURIComponent(p.enc)
+      + '&enc=' + encodeURIComponent(p.workEnc);
+  }
+
+  function examListUrl(domain, c, p, cpi) {
+    return domain + '/exam-ans/mooc2/exam/exam-list?courseid=' + encodeURIComponent(c.courseId)
+      + '&clazzid=' + encodeURIComponent(c.classId)
+      + '&cpi=' + encodeURIComponent(cpi)
+      + '&ut=s&t=' + encodeURIComponent(p.t)
+      + '&enc=' + encodeURIComponent(p.examEnc);
+  }
+
+  function chapterUrl(c, p, cpi, domain) {
+    return (domain || 'https://mooc2-ans.chaoxing.com') + '/mooc2-ans/mycourse/studentcourse?courseid='
+      + encodeURIComponent(c.courseId)
+      + '&clazzid=' + encodeURIComponent(c.classId)
+      + '&cpi=' + encodeURIComponent(cpi)
+      + '&ut=s&t=' + encodeURIComponent(p.t)
+      + '&stuenc=' + encodeURIComponent(p.enc);
+  }
+
+  // 抓一门课的三个数据页。
+  // opts 里已经成功的部分直接跳过（重试轮用得上），返回各部分结果 + 失败清单，
+  // 这样重试时只补失败的那一项，不用把整门课重取一遍。
+  //
+  // 关键：作业 / 考试 / 章节这三个页面**互不依赖**（都只依赖门户参数），
+  // 所以并行发起。串行的话每门课是「门户 → 作业 → 考试 → 章节」4 步串行，
+  // 单请求 4 秒的话课程并发就被这个链卡死（43 门课仿真 32 秒）；
+  // 并行之后每门课只有 2 步（门户 → 三个数据页同时），耗时明显下降。
+  async function loadCourse(course, idx, opts) {
+    opts = opts || {};
+    const out = { work: null, exam: null, chapter: null, failed: [], portal: null, noData: false };
+    if (course.ended) return out;
+    const p = opts.portal || await openPortal(course, idx);
+    out.portal = p;
+    const cpi = p.cpi || course.cpi || '';
+    const domain = p.domain || 'https://mooc1.chaoxing.com';
+    // 作业/考试优先回到门户参数来源的那个域名
+    const dlist = dataDomains(domain, idx, p.host);
+    const now = Date.now();
+    const jobs = [];
+
+    if (p.workEnc && !opts.workOk) {
+      const label = '[' + course.name + '] 作业列表';
+      jobs.push((async function () {
+        try {
+          const got = await fetchData(function (d) { return workListUrl(d, course, p, cpi); },
+            label, dlist, { primaryHost: p.host });
+          out.work = parseTasks(got.text, course.name, '作业', now);
+          if (got.empty) out.noData = true;
+          log(label + ' 解析出 ' + out.work.length + ' 条'
+            + (out.work.length ? ' 首条=' + out.work[0].work + ' ' + out.work[0].status : ''));
+        } catch (e) {
+          out.failed.push('work');
+          log(label + ' 失败: ' + (e && e.message ? e.message : '失败'));
+        }
+      })());
+    }
+    if (p.examEnc && !opts.examOk) {
+      const label = '[' + course.name + '] 考试列表';
+      jobs.push((async function () {
+        try {
+          const got = await fetchData(function (d) { return examListUrl(d, course, p, cpi); },
+            label, dlist, { primaryHost: p.host });
+          out.exam = parseTasks(got.text, course.name, '考试', now);
+          if (got.empty) out.noData = true;
+          log(label + ' 解析出 ' + out.exam.length + ' 条');
+        } catch (e) {
+          out.failed.push('exam');
+          log(label + ' 失败: ' + (e && e.message ? e.message : '失败'));
+        }
+      })());
+    }
+
+    const courseOpen = !course.ended && (course.endMs == null || course.endMs > now);
+    if (courseOpen && !opts.chapterOk) {
+      const label = '[' + course.name + '] 章节';
+      jobs.push((async function () {
+        try {
+          const got = await fetchData(function (d) { return chapterUrl(course, p, cpi, d); },
+            label, ['https://mooc2-ans.chaoxing.com']);
+          out.chapter = [];
+          if (got.empty) out.noData = true;
+          parseChapters(got.text).forEach(function (ch) {
+            out.chapter.push({
+              course: course.name,
+              chapter: ch.name,
+              pending: ch.pending,
+              endMs: course.endMs
+            });
+          });
+          log(label + ' 未完成章节 ' + out.chapter.length + ' 个');
+        } catch (e) {
+          out.failed.push('chapter');
+          log(label + ' 失败: ' + (e && e.message ? e.message : '失败'));
+        }
+      })());
+    }
+    await Promise.all(jobs);
+    return out;
+  }
+
+  function formatRemain(ms) {
+    if (ms < 0) return '已截止';
+    const total = Math.floor(ms / 60000);
+    const d = Math.floor(total / 1440);
+    const h = Math.floor((total % 1440) / 60);
+    const m = total % 60;
+    let s = '';
+    if (d) s += d + '天';
+    if (d || h) s += h + '小时';
+    s += m + '分钟';
+    return s;
+  }
+
+  function render() {
+    const now = Date.now();
+    const sorted = rows.slice().sort(function (a, b) { return a.deadline - b.deadline; });
+    const chapters = chapterRows.slice().sort(function (a, b) {
+      const ae = a.endMs == null ? Infinity : a.endMs;
+      const be = b.endMs == null ? Infinity : b.endMs;
+      return ae - be;
+    });
+    const hot = sorted.filter(function (r) { return r.deadline - now < SEVEN_DAYS; }).length;
+    titleEl.textContent = (minimized
+      ? ('未截止 ' + sorted.length + ' · 章节 ' + chapters.length)
+      : ('未截止 ' + sorted.length + ' 项 · 未看完章节 ' + chapters.length)) + ' v' + VERSION;
+    const seen = {};
+    const courses = [];
+    chapters.forEach(function (r) {
+      if (seen[r.course]) return;
+      seen[r.course] = 1;
+      courses.push(r);
+    });
+    const html = ['<div class="cx-col"><div class="cx-sec">作业 / 考试</div>'];
+    if (!sorted.length) {
+      html.push('<div class="cx-empty">没有还没截止的</div>');
+    } else {
+      html.push('<table><thead><tr><th>课程</th><th>名称</th><th>还剩</th></tr></thead><tbody>');
+      sorted.forEach(function (r) {
+        const left = r.deadline - now;
+        const cls = r.settled ? ' class="cx-ok"' : (left < SEVEN_DAYS ? ' class="cx-hot"' : '');
+        html.push(
+          '<tr' + cls + '><td class="cx-name">' + escapeHtml(r.course) + '</td><td class="cx-work"><span class="cx-kind">[' + r.kind + ']</span>'
+          + escapeHtml(r.work) + ' ' + (r.settled ? '已完成' : '未完成') + '</td><td>' + formatRemain(left) + '</td></tr>'
+        );
+      });
+      html.push('</tbody></table>');
+    }
+    html.push('</div><div class="cx-col"><div class="cx-sec">未看完课程</div>');
+    if (!courses.length) {
+      html.push('<div class="cx-empty">没有未看完的课</div>');
+    } else {
+      html.push('<table><thead><tr><th>课程名称</th><th>课程还剩</th></tr></thead><tbody>');
+      courses.forEach(function (r) {
+        const leftText = r.endMs == null ? '未显示结课时间' : formatRemain(r.endMs - now);
+        html.push('<tr><td class="cx-name">' + escapeHtml(r.course) + '</td><td>' + leftText + '</td></tr>');
+      });
+      html.push('</tbody></table>');
+    }
+    html.push('</div>');
+    bodyEl.innerHTML = html.join('');
+  }
+
+  async function mapPool(items, limit, worker) {
+    const ret = new Array(items.length);
+    let cursor = 0;
+    async function run() {
+      while (cursor < items.length) {
+        const i = cursor++;
+        ret[i] = await worker(items[i], i);
+      }
+    }
+    const n = Math.min(limit, items.length);
+    const jobs = [];
+    for (let i = 0; i < n; i++) jobs.push(run());
+    await Promise.all(jobs);
+    return ret;
+  }
+
+  let scanGen = 0;
+
+  async function scan() {
+    const gen = ++scanGen;
+    loading = true;
+    const courses = coursesFromPage();
+    if (!courses.length) {
+      rows = [];
+      chapterRows = [];
+      titleEl.textContent = '没有课程';
+      bodyEl.innerHTML = '<div class="cx-empty">当前筛选下没有课程</div>';
+      footEl.textContent = '';
+      loading = false;
+      setScanBtn('▶ 扫描', false);
+      return;
+    }
+    const errors = [];
+    const retryList = [];
+    let done = 0;
+    const t0 = Date.now();
+    // 每轮扫描重新开始：之前被反爬弃用的域名可以再试一次
+    resetBans();
+    resetHits();
+    log('===== 开始扫描，共 ' + courses.length + ' 门课，脚本 v' + VERSION + ' =====');
+    log('页面地址: ' + location.href);
+    log('识别到的课程数: ' + courses.length);
+    // 卡片链接落在哪个域名，直接决定了会不会撞上 mooc1 的反爬，必须打出来
+    const hostCount = {};
+    courses.forEach(function (c) {
+      const h = hostOf(c.href) || '(无链接)';
+      hostCount[h] = (hostCount[h] || 0) + 1;
+    });
+    log('卡片链接域名分布: ' + Object.keys(hostCount).map(function (k) {
+      return k + '×' + hostCount[k];
+    }).join('  '));
+    if (courses.length) {
+      log('入口顺序示例[' + courses[0].name + ']: ' + portalCandidates(courses[0], 0).map(function (c, i) {
+        return (i + 1) + '.' + c.family + '=' + String(c.url).slice(0, 95);
+      }).join('  |  '));
+    }
+    if (!courses.length) probePage();
+    titleEl.textContent = '正在读取 0/' + courses.length;
+    bodyEl.innerHTML = '<div class="cx-empty">正在逐门读取作业、考试和章节…</div>';
+    footEl.textContent = '左：7天内未完成标红，已完成或待批改且还有剩余时间标绿。右：未看完课程';
+    // 结果按课程存，重试时覆盖（而不是追加），避免同一门课的数据重复计入
+    const results = {};
+    const keyOf = function (c) { return c.courseId + ':' + c.classId; };
+    await mapPool(courses, CONCURRENCY_FAST, async function (course, i) {
+      if (gen !== scanGen) return;
+      try {
+        const pack = await loadCourse(course, i);
+        if (gen !== scanGen) return;
+        results[keyOf(course)] = pack;
+        if (pack.failed.length) retryList.push(course);
+        log('[' + course.name + '] 完成：作业/考试 '
+          + ((pack.work ? pack.work.length : 0) + (pack.exam ? pack.exam.length : 0))
+          + ' 条，未完成章节 ' + (pack.chapter ? pack.chapter.length : 0)
+          + ' 个' + (pack.failed.length ? '（' + pack.failed.join('/') + ' 待重试）' : ''));
+      } catch (err) {
+        const msg = err && err.message ? err.message : '失败';
+        errors.push(course.name + '：' + msg);
+        results[keyOf(course)] = { work: null, exam: null, chapter: null, failed: ['portal'], portal: null, noData: false };
+        retryList.push(course);
+        log('[' + course.name + '] 失败：' + msg);
+      }
+      done += 1;
+      if (gen === scanGen) titleEl.textContent = '正在读取 ' + done + '/' + courses.length;
+    });
+    // 第一轮没读全的门课，等一会儿再重试一次。
+    // 只补失败的那一项（复用已拿到的门户参数），不用把整门课重取一遍。
+    if (retryList.length && gen === scanGen) {
+      log('===== 有 ' + retryList.length + ' 门没读全，等 4 秒后重试一轮 =====');
+      titleEl.textContent = '正在重试 ' + retryList.length + ' 门';
+      await sleep(4000);
+      // 重试前把弃用名单清掉：上一轮被拦的域名，过几秒可能已经放行
+      resetBans();
+      await mapPool(retryList, 2, async function (course, i) {
+        if (gen !== scanGen) return;
+        const prev = results[keyOf(course)] || {};
+        try {
+          const pack = await loadCourse(course, i + 500, {
+            portal: prev.portal,
+            workOk: prev.failed.indexOf('work') < 0,
+            examOk: prev.failed.indexOf('exam') < 0,
+            chapterOk: prev.failed.indexOf('chapter') < 0
+          });
+          if (gen !== scanGen) return;
+          // 只用重试补上的部分覆盖，其它部分保留第一轮的结果。
+          // 注意：第一轮若是「门户就失败」，prev.failed 里只有 'portal'，三个数据项都不在，
+          // 这时必须整体采用重试结果，否则第一轮拿到的 null 会把重试补回的数据覆盖掉。
+          const portalFailed = !prev.portal;
+          const want = function (k) { return portalFailed || prev.failed.indexOf(k) >= 0; };
+          results[keyOf(course)] = {
+            work: want('work') ? pack.work : prev.work,
+            exam: want('exam') ? pack.exam : prev.exam,
+            chapter: want('chapter') ? pack.chapter : prev.chapter,
+            failed: pack.failed,
+            noData: !!(prev.noData || pack.noData),
+            portal: pack.portal || prev.portal
+          };
+          const r = results[keyOf(course)];
+          log('[' + course.name + '] 重试完成：作业/考试 '
+            + ((r.work ? r.work.length : 0) + (r.exam ? r.exam.length : 0))
+            + ' 条，未完成章节 ' + (r.chapter ? r.chapter.length : 0)
+            + ' 个' + (r.failed.length ? '（仍失败：' + r.failed.join('/') + '）' : ''));
+        } catch (err) {
+          log('[' + course.name + '] 重试仍失败：' + (err && err.message ? err.message : '失败'));
+        }
+      });
+    }
+    if (gen !== scanGen) return;
+    // 汇总：每门课只贡献一次
+    const nextRows = [];
+    const nextChapters = [];
+    let noDataCount = 0;
+    let partialCount = 0;
+    courses.forEach(function (c) {
+      const r = results[keyOf(c)];
+      if (!r) return;
+      if (r.work) nextRows.push.apply(nextRows, r.work);
+      if (r.exam) nextRows.push.apply(nextRows, r.exam);
+      if (r.chapter) nextChapters.push.apply(nextChapters, r.chapter);
+      // 「没有数据」和「读取失败」是两回事，汇总里必须分开报
+      if (r.noData) noDataCount += 1;
+      if (r.failed && r.failed.length) partialCount += 1;
+    });
+    rows = nextRows;
+    chapterRows = nextChapters;
+    loading = false;
+    setScanBtn('↻ 重新扫描', false);
+    render();
+    const secs = ((Date.now() - t0) / 1000).toFixed(1);
+    log('===== 扫描结束：作业/考试 ' + nextRows.length + ' 条，未完成章节 '
+      + nextChapters.length + ' 个，无数据 ' + noDataCount + ' 门，部分失败 ' + partialCount
+      + ' 门，读取失败 ' + errors.length + ' 门，用时 ' + secs
+      + ' 秒（v' + VERSION + '，' + courses.length + ' 门课） =====');
+    log('请求分布（共 ' + totalHits + ' 次）：' + (Object.keys(hostHits).sort(function (a, b) {
+      return hostHits[b] - hostHits[a];
+    }).map(function (k) {
+      return k.replace('.chaoxing.com', '') + '=' + hostHits[k];
+    }).join(' ') || '无')
+      + ' | GM 内部跳转落点：' + (Object.keys(landHits).map(function (k) {
+        return k.replace('.chaoxing.com', '') + '=' + landHits[k];
+      }).join(' ') || '无'));
+    footEl.textContent = errors.length
+      ? ('有 ' + errors.length + ' 门没读全，点 ☰ 看详细日志')
+      : '按住蓝条拖动。课程页会按当前学期筛选结果读取。不足7天且未完成标红。';
+  }
+
+  setInterval(function () {
+    if (!loading && (rows.length || chapterRows.length)) render();
+  }, 30000);
+
+  // v2.5.0：不再自动扫描。
+  // 以前是「页面一加载 + DOM 一变化 + 切学期筛选」就自动跑，刷新一次就白扫一遍，
+  // 还会在用户没要求的时候先打出去几十个请求。现在改成纯手动：点「▶ 扫描」才发请求。
+  log('脚本 v' + VERSION + ' 已就绪（' + location.host + '），点「▶ 扫描」开始读取；不会自动读取');
+  renderIdle();
+})();
