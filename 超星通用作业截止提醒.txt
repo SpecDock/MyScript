@@ -1,14 +1,17 @@
 // ==UserScript==
 // @name         超星通用课程截止提醒
 // @namespace    chaoxing-deadline
-// @version      2.6.2
-// @description  通用课程和课程都读取：只列出还没截止的作业和考试，另列出未结课且章节没看完的课程
+// @version      2.8.3
+// @description  通用课程（含新版）和课程都读取：列出还没截止的作业和考试（含未设置截止时间的），单列最近30天已结束且未作答的作业，另列出未结课且章节没看完的课程
 // @match        https://mooc1-2.chaoxing.com/visit/courses*
 // @match        https://mooc1-2.chaoxing.com/mooc-ans/visit/courses*
 // @match        https://mooc1.chaoxing.com/visit/courses*
 // @match        https://mooc1-2.chaoxing.com/visit/interaction*
 // @match        https://mooc1-2.chaoxing.com/mooc-ans/visit/interaction*
 // @match        https://mooc1.chaoxing.com/visit/interaction*
+// @match        https://mooc2-ans.chaoxing.com/mooc2-ans/visit/interaction*
+// @match        https://mooc2-ans.chaoxing.com/mooc2-ans/visit/courses*
+// @match        https://i.chaoxing.com/base*
 // @match        https://*.chaoxing.com/wfw/courselist/course3*
 // @match        https://*.chaoxing.com/fyportal/courselist/course3*
 // @match        https://*.chaoxing.com/courselist/course3*
@@ -31,7 +34,21 @@
 (function () {
   'use strict';
 
+  // i.chaoxing.com/base 是个人空间外壳，课程内容都在 iframe 里
+  // （旧版通用课程 → mooc1-2，新版通用课程 → mooc2-ans）。
+  // 外壳本身没有课程数据，注入只会多出一个空面板，所以直接跳过，交给 iframe 里的脚本。
+  const shellFrame = document.getElementById('frame_content')
+    || Array.from(document.querySelectorAll('iframe')).some(function (f) {
+      return /\/visit\/(interaction|courses)/.test(f.src || '');
+    });
+  if (location.hostname === 'i.chaoxing.com' && shellFrame) return;
+
   const SEVEN_DAYS = 7 * 24 * 60 * 60 * 1000;
+  // 「最近已结束」分区的时间窗口：只看 30 天内结束的未作答作业。
+  const THIRTY_DAYS = 30 * 24 * 60 * 60 * 1000;
+  // 列表翻页上限。作业列表每页 12 条，40 页足够覆盖 480 条；
+  // 这个上限防的是分页脚本给出异常 pageNum 时无限翻页。
+  const MAX_LIST_PAGES = 40;
   // 单个请求的超时。20 秒太长：一旦有几个请求卡住，光超时就够把整轮拖到一分钟以上，
   // 而超时的请求本来也要走重试/换域名。12 秒足够正常页面返回，卡住的早点放弃更快。
   const FETCH_TIMEOUT = 12000;
@@ -62,18 +79,32 @@
       top: 72px;
       right: 18px;
       z-index: 2147483646;
-      width: 640px;
+      width: 880px;
+      height: min(560px, calc(100vh - 120px));
+      min-width: min(600px, calc(100vw - 16px));
+      min-height: 200px;
       max-width: calc(100vw - 16px);
+      max-height: calc(100vh - 16px);
+      display: flex;
+      flex-direction: column;
+      box-sizing: border-box;
       background: #fff;
       color: #1f2937;
       border: 1px solid #e5e7eb;
       border-radius: 8px;
       box-shadow: 0 8px 24px rgba(15, 23, 42, 0.16);
-      font: 12px/1.3 "Microsoft YaHei", "PingFang SC", sans-serif;
+      font: 12px/1.35 "Microsoft YaHei", "PingFang SC", sans-serif;
       overflow: hidden;
     }
-    #cx-deadline.is-min { width: 280px; }
+    #cx-deadline.is-min {
+      width: 300px;
+      height: 30px;
+      min-width: 220px;
+      min-height: 30px;
+    }
+    #cx-deadline.is-min .cx-rz { display: none; }
     #cx-deadline .cx-bar {
+      flex: 0 0 30px;
       height: 30px;
       display: flex;
       align-items: center;
@@ -107,32 +138,78 @@
     }
     #cx-deadline .cx-start button:hover { background: #2b5480; }
     #cx-deadline .cx-start p { margin: 9px 0 0; color: #64748b; font-size: 11px; line-height: 1.5; }
-    #cx-deadline .cx-body { max-height: 420px; overflow: auto; background: #fff; display: flex; align-items: flex-start; }
-    #cx-deadline .cx-col { width: 50%; min-width: 0; max-height: 420px; overflow: auto; }
-    #cx-deadline .cx-col + .cx-col { border-left: 1px solid #e5e7eb; }
+    #cx-deadline .cx-body {
+      flex: 1 1 auto;
+      min-height: 0;
+      display: flex;
+      align-items: stretch;
+      overflow: hidden;
+      background: #fff;
+    }
+    #cx-deadline .cx-col { flex: 1.35 1 0; width: auto; min-width: 0; max-height: none; overflow: auto; }
+    #cx-deadline .cx-col + .cx-col { flex: 1 1 0; border-left: 1px solid #e5e7eb; }
+    #cx-deadline .cx-start { flex: 1 1 auto; }
     #cx-deadline .cx-sec { padding: 4px 8px; background: #f8fafc; color: #1e3a5f; font-weight: 650; border-bottom: 1px solid #e5e7eb; }
-    #cx-deadline table { width: 100%; border-collapse: collapse; }
+    #cx-deadline .cx-sec.cx-sub { border-top: 1px solid #cbd5e1; background: #eef2f7; }
+    #cx-deadline table { width: 100%; border-collapse: collapse; table-layout: fixed; }
     #cx-deadline th, #cx-deadline td {
-      padding: 3px 6px;
+      padding: 3px 5px;
       text-align: left;
       border-bottom: 1px solid #f1f5f9;
       vertical-align: top;
+      word-break: break-word;
+      overflow-wrap: anywhere;
     }
     #cx-deadline th { position: sticky; top: 0; background: #f8fafc; color: #64748b; font-weight: 600; }
-    #cx-deadline td.cx-name { width: 34%; }
-    #cx-deadline td.cx-work { width: 40%; }
+    #cx-deadline table.cx-tasks th:nth-child(1) { width: 26%; }
+    #cx-deadline table.cx-tasks th:nth-child(3) { width: 27%; }
+    #cx-deadline table.cx-ended th:nth-child(1) { width: 26%; }
+    #cx-deadline table.cx-ended th:nth-child(3) { width: 29%; }
+    #cx-deadline table.cx-chapters th:nth-child(2) { width: 38%; }
+    #cx-deadline table.cx-tasks td:last-child,
+    #cx-deadline table.cx-ended td:last-child,
+    #cx-deadline table.cx-chapters td:last-child { font-size: 11px; }
+    /* 边框拖拽手柄（放在面板内侧，避免被 overflow:hidden 裁掉） */
+    #cx-deadline .cx-rz { position: absolute; z-index: 6; touch-action: none; }
+    #cx-deadline .cx-rz-n, #cx-deadline .cx-rz-s { left: 10px; right: 10px; height: 6px; cursor: ns-resize; }
+    #cx-deadline .cx-rz-n { top: 0; }
+    #cx-deadline .cx-rz-s { bottom: 0; }
+    #cx-deadline .cx-rz-w, #cx-deadline .cx-rz-e { top: 10px; bottom: 10px; width: 6px; cursor: ew-resize; }
+    #cx-deadline .cx-rz-w { left: 0; }
+    #cx-deadline .cx-rz-e { right: 0; }
+    #cx-deadline .cx-rz-ne, #cx-deadline .cx-rz-nw,
+    #cx-deadline .cx-rz-se, #cx-deadline .cx-rz-sw { width: 12px; height: 12px; }
+    #cx-deadline .cx-rz-ne { top: 0; right: 0; cursor: nesw-resize; }
+    #cx-deadline .cx-rz-nw { top: 0; left: 0; cursor: nwse-resize; }
+    #cx-deadline .cx-rz-se { bottom: 0; right: 0; cursor: nwse-resize; }
+    #cx-deadline .cx-rz-sw { bottom: 0; left: 0; cursor: nesw-resize; }
+    #cx-deadline .cx-rz-se::after {
+      content: '';
+      position: absolute;
+      right: 3px;
+      bottom: 3px;
+      width: 7px;
+      height: 7px;
+      border-right: 2px solid #94a3b8;
+      border-bottom: 2px solid #94a3b8;
+    }
     #cx-deadline tr.cx-hot td { color: #dc2626; font-weight: 650; background: #fff5f5; }
+    #cx-deadline tr.cx-nodue td { color: #b45309; font-weight: 650; background: #fffbeb; }
     #cx-deadline tr.cx-ok td { color: #15803d; background: #f0fdf4; }
     #cx-deadline tr.cx-done td { color: #15803d; font-weight: 650; background: #f0fdf4; }
+    #cx-deadline tr.cx-ended td { color: #475569; background: #f8fafc; }
+    #cx-deadline tr.cx-ended .cx-kind { color: #64748b; }
     #cx-deadline .cx-kind { color: #64748b; font-weight: 500; margin-right: 4px; }
     #cx-deadline tr.cx-hot .cx-kind { color: #dc2626; }
+    #cx-deadline tr.cx-nodue .cx-kind { color: #b45309; }
     #cx-deadline tr.cx-ok .cx-kind,
     #cx-deadline tr.cx-done .cx-kind { color: #15803d; }
     #cx-deadline .cx-status { display: block; color: #94a3b8; font-size: 11px; font-weight: 400; }
     #cx-deadline tr.cx-hot .cx-status { color: #f87171; }
     #cx-deadline tr.cx-done .cx-status { color: #16a34a; }
-    #cx-deadline .cx-foot { padding: 4px 8px; color: #64748b; background: #f8fafc; font-size: 11px; }
+    #cx-deadline .cx-foot { flex: 0 0 auto; padding: 4px 8px; color: #64748b; background: #f8fafc; font-size: 11px; }
     #cx-deadline .cx-log {
+      flex: 0 0 auto;
       max-height: 190px; overflow: auto; background: #0f172a; color: #cbd5e1;
       font: 11px/1.45 Consolas, Menlo, monospace; padding: 6px 8px; word-break: break-all;
     }
@@ -151,7 +228,15 @@
     </div>
     <div class="cx-body"></div>
     <div class="cx-log" style="display:none"></div>
-    <div class="cx-foot">把鼠标按在上方蓝条上可拖动</div>
+    <div class="cx-foot">拖动蓝条移动，拖动边框调整大小</div>
+    <span class="cx-rz cx-rz-n" data-dir="n"></span>
+    <span class="cx-rz cx-rz-s" data-dir="s"></span>
+    <span class="cx-rz cx-rz-w" data-dir="w"></span>
+    <span class="cx-rz cx-rz-e" data-dir="e"></span>
+    <span class="cx-rz cx-rz-ne" data-dir="ne"></span>
+    <span class="cx-rz cx-rz-nw" data-dir="nw"></span>
+    <span class="cx-rz cx-rz-se" data-dir="se"></span>
+    <span class="cx-rz cx-rz-sw" data-dir="sw"></span>
   `;
   document.documentElement.appendChild(panel);
 
@@ -162,7 +247,7 @@
   const minBtn = panel.querySelector('[data-act="min"]');
   const logBtn = panel.querySelector('[data-act="log"]');
   const scanBtn = panel.querySelector('[data-act="scan"]');
-  const VERSION = '2.6.2';
+  const VERSION = '2.8.3';
   let logLines = [];
 
   function log(msg) {
@@ -184,11 +269,25 @@
     if (show) renderLog();
   });
   let rows = [];
+  let endedRows = [];
   let chapterRows = [];
   let minimized = false;
   let loading = false;
 
+  // 拖拽调整过大小后宽高是内联的，会盖掉 .is-min 的固定尺寸，最小化前先存起来。
+  let savedSize = null;
+
   function setMinimized(next) {
+    if (next === minimized) return;
+    if (next) {
+      savedSize = { width: panel.style.width, height: panel.style.height };
+      panel.style.width = '';
+      panel.style.height = '';
+    } else if (savedSize) {
+      panel.style.width = savedSize.width;
+      panel.style.height = savedSize.height;
+      savedSize = null;
+    }
     minimized = next;
     panel.classList.toggle('is-min', minimized);
     bodyEl.style.display = minimized ? 'none' : '';
@@ -211,7 +310,7 @@
     titleEl.textContent = '点击「▶ 扫描」开始';
     bodyEl.innerHTML = '<div class="cx-start">'
       + '<button type="button" data-act="start">▶ 开始扫描</button>'
-      + '<p>只读取当前页面可见的课程（课程页按当前学期筛选）<br>读取作业、考试截止时间与未看完的章节</p></div>';
+      + '<p>只读取当前页面可见的课程（课程页按当前学期筛选）<br>读取作业、考试（含无截止时间）与未看完章节，另列最近30天已结束且未作答的作业</p></div>';
     const b = bodyEl.querySelector('[data-act="start"]');
     if (b) b.addEventListener('click', function (e) { e.stopPropagation(); startScan(); });
   }
@@ -251,6 +350,69 @@
     panel.style.top = top + 'px';
   });
   document.addEventListener('mouseup', function () { dragging = false; });
+
+  // 八方向拖边框调整大小。用 pointer 事件，同时兼容鼠标和触屏。
+  let resizing = null;
+  panel.querySelectorAll('.cx-rz').forEach(function (handle) {
+    handle.addEventListener('pointerdown', function (e) {
+      if (e.button !== 0 || minimized) return;
+      const rect = panel.getBoundingClientRect();
+      resizing = {
+        dir: handle.getAttribute('data-dir') || '',
+        x: e.clientX,
+        y: e.clientY,
+        left: rect.left,
+        top: rect.top,
+        width: rect.width,
+        height: rect.height
+      };
+      panel.style.right = 'auto';
+      panel.style.left = rect.left + 'px';
+      panel.style.top = rect.top + 'px';
+      panel.style.width = rect.width + 'px';
+      panel.style.height = rect.height + 'px';
+      e.preventDefault();
+      e.stopPropagation();
+      try { if (handle.setPointerCapture) handle.setPointerCapture(e.pointerId); } catch (err) {}
+    });
+  });
+
+  document.addEventListener('pointermove', function (e) {
+    if (!resizing) return;
+    const d = resizing.dir;
+    const minW = Math.min(600, Math.max(320, window.innerWidth - 8));
+    const minH = Math.min(200, Math.max(120, window.innerHeight - 8));
+    const maxW = Math.max(minW, window.innerWidth - 8);
+    const maxH = Math.max(minH, window.innerHeight - 8);
+    const dx = e.clientX - resizing.x;
+    const dy = e.clientY - resizing.y;
+    let left = resizing.left;
+    let top = resizing.top;
+    let width = resizing.width;
+    let height = resizing.height;
+
+    if (d.indexOf('e') >= 0) width = resizing.width + dx;
+    if (d.indexOf('s') >= 0) height = resizing.height + dy;
+    if (d.indexOf('w') >= 0) width = resizing.width - dx;
+    if (d.indexOf('n') >= 0) height = resizing.height - dy;
+
+    width = Math.min(maxW, Math.max(minW, width));
+    height = Math.min(maxH, Math.max(minH, height));
+    if (d.indexOf('w') >= 0) left = resizing.left + resizing.width - width;
+    if (d.indexOf('n') >= 0) top = resizing.top + resizing.height - height;
+    // 尺寸到边界后继续拖，不能把面板挪出视口。
+    left = Math.max(0, Math.min(left, window.innerWidth - width));
+    top = Math.max(0, Math.min(top, window.innerHeight - height));
+
+    panel.style.width = width + 'px';
+    panel.style.height = height + 'px';
+    panel.style.left = left + 'px';
+    panel.style.top = top + 'px';
+  });
+
+  function stopResize() { resizing = null; }
+  document.addEventListener('pointerup', stopResize);
+  document.addEventListener('pointercancel', stopResize);
 
   function headerValue(res, name) {
     const raw = res.responseHeaders || '';
@@ -811,7 +973,7 @@
   // 探测页面上真实存在的课程容器与卡片选择器，避免选择器猜错导致整页 0 门。
   function probePage() {
     const hits = [];
-    ['#courseList', '#courselistArea', 'li.w_couritem', '#stuCourseList', 'li.courseItem', 'li.course-item']
+    ['#courseList', '#courselistArea', 'li.w_couritem', '#stuCourseList', 'li.courseItem', 'li.course-item', '.course.learnCourse']
       .forEach(function (sel) {
         const n = document.querySelectorAll(sel).length;
         hits.push(sel + '=' + n);
@@ -854,8 +1016,45 @@
     return out;
   }
 
+  // 新版通用课程页（mooc2-ans 的 /mooc2-ans/visit/interaction，以及 mooc1-2 的同名过渡页）
+  // 卡片结构（实测 2026-11）：
+  //   div.course.learnCourse[info="classId_cpi"]
+  //     > input[name=clazzId] / input[name=courseId] / input.curPersonId
+  //     > a[href*=stucoursemiddle] > span.course-name[title]
+  // 注意新版隐藏域叫 clazzId（不是 classId），旧解析器会读空。
+  function parseMooc2Courses() {
+    const out = [];
+    document.querySelectorAll('.courselistArea .course, .course.learnCourse').forEach(function (el) {
+      const val = function (sel) {
+        const x = el.querySelector(sel);
+        return (x && x.value ? x.value : '').trim();
+      };
+      const info = el.getAttribute('info') || '';
+      const hrefEl = el.querySelector('a[href*="stucoursemiddle"]') || el.querySelector('a.color1[href]');
+      const href = (hrefEl && hrefEl.href) || '';
+      const pick = function (re) { return (href.match(re) || [])[1] || ''; };
+      const courseId = val('input[name="courseId"], input.courseId') || pick(/[?&]courseid=(\d+)/i);
+      const classId = val('input[name="clazzId"], input.clazzId')
+        || (info.split('_')[0] || '') || pick(/[?&]clazzid=(\d+)/i);
+      const cpi = val('input.curPersonId')
+        || (info.split('_')[1] || '') || pick(/[?&]cpi=(\d+)/i);
+      const nameEl = el.querySelector('span.course-name, a.color1[title]');
+      const name = ((nameEl && (nameEl.getAttribute('title') || nameEl.textContent)) || '').trim();
+      if (!courseId || !classId || !name) {
+        log('新版课程卡片缺参数 courseId=' + courseId + ' classId=' + classId + ' name=' + name);
+        return;
+      }
+      if (!isShown(el)) return;
+      const cardText = (el.innerText || '').replace(/\s+/g, '');
+      out.push(courseItem(name, courseId, classId, cpi, href, cardText, detectEnded(cardText, el)));
+    });
+    return out;
+  }
+
   function coursesFromPage() {
     const list = [];
+    // 新版通用课程（mooc2-ans / mooc1-2 的 visit/interaction）
+    list.push.apply(list, parseMooc2Courses());
     // 通用课程（/visit/courses）
     list.push.apply(list, parseCommonCourses());
     // 兼容旧版通用课程页的选择器
@@ -884,7 +1083,14 @@
       const cardText = (li.innerText || '').replace(/\s+/g, '');
       list.push(courseItem(name, courseId, classId, cpi, a.href, cardText, detectEnded(cardText, li)));
     });
-    return list;
+    // 同一张卡片可能同时命中新旧选择器，按「课程+班级」去重。
+    const seen = {};
+    return list.filter(function (c) {
+      const key = c.courseId + ':' + c.classId;
+      if (seen[key]) return false;
+      seen[key] = 1;
+      return true;
+    });
   }
 
   function isShown(el) {
@@ -934,7 +1140,9 @@
   function parseDeadline(text, now) {
     const t = String(text || '').replace(/\s+/g, '');
     if (!t) return null;
-    if (/已结束|已截止|已过期/.test(t)) return now - 60000;
+    // 「已结束/已截止」只说明状态，不给出时间：交给调用方标记 ended，
+    // 真实结束时间只能从作业详情页拿（以前这里返回 now-60000 会让排序和展示都失真）。
+    if (/已结束|已截止|已过期/.test(t)) return null;
     let ms = 0;
     let hit = false;
     const day = t.match(/(\d+)天/);
@@ -956,6 +1164,15 @@
     return null;
   }
 
+  // 未设置截止时间的任务，超星不会渲染 .time 元素（或留空）。
+  // 注意：列表页只在「还有剩余时间」时才渲染 .time，已经结束的作业同样没有 .time，
+  // 所以列表本身区分不了「已结束」和「没设置截止时间」。
+  // 这里先保留所有无时间的作业（交给详情页确认结束时间），已完成/待批阅的也保留：
+  // 用户需要看到「确实没有截止时间」的作业，包括已经提交的；只有确实有截止时间且已经过期的才丢弃。
+  // 返回的每条记录可能是：
+  //   · 正常未截止：deadline > now；
+  //   · 无截止时间：noDue=true，交给详情页确认（列表页不给 .time）；
+  //   · 已结束：ended=true，endTime 可能为 null（列表只说「已结束」），同样交给详情页补时间。
   function parseTasks(html, courseName, kind, now) {
     const out = [];
     let doc = null;
@@ -965,16 +1182,29 @@
       const status = ((li.querySelector('.status') || {}).textContent || '').replace(/\s+/g, '');
       const timeText = ((li.querySelector('.time') || {}).textContent || '').replace(/\s+/g, '');
       if (!name) return;
+      if (/已过期|已失效|已结束/.test(status)) return;
       const settled = /待批阅|待批改|已完成|已批阅/.test(status);
-      const deadline = parseDeadline(timeText, now);
-      if (deadline == null || deadline <= now) return;
+      let deadline = parseDeadline(timeText, now);
+      let ended = /已结束|已截止|已过期/.test(timeText);
+      let endTime = null;
+      if (deadline != null && deadline <= now) {
+        ended = true;
+        endTime = deadline;
+        deadline = null;
+      }
+      // 考试列表没有详情页可确认时间，已完成的考试保持原样（无时间就不列），避免误标成无截止。
+      if (deadline == null && settled && kind !== '作业') return;
       out.push({
         course: courseName,
         work: name,
         kind: kind,
         status: status,
         settled: settled,
-        deadline: deadline
+        deadline: deadline,
+        noDue: deadline == null,
+        ended: ended,
+        endTime: endTime,
+        detailUrl: kind === '作业' ? (li.getAttribute('data') || '') : ''
       });
     });
     if (out.length || !/剩余|还剩/.test(html)) return out;
@@ -983,13 +1213,158 @@
       const status = textOf(part.match(/class="status[^"]*"[^>]*>([\s\S]*?)<\/p>/i)).replace(/\s+/g, '');
       const timeText = textOf(part.match(/class="time[^"]*"[^>]*>([\s\S]*?)<\/div>/i)).replace(/\s+/g, '');
       if (!name) return;
+      if (/已过期|已失效|已结束/.test(status)) return;
       const settled = /待批阅|待批改|已完成|已批阅/.test(status);
-      const deadline = parseDeadline(timeText, now);
-      if (deadline == null || deadline <= now) return;
-      out.push({ course: courseName, work: name, kind: kind, status: status, settled: settled, deadline: deadline });
+      let deadline = parseDeadline(timeText, now);
+      let ended = /已结束|已截止|已过期/.test(timeText);
+      let endTime = null;
+      if (deadline != null && deadline <= now) {
+        ended = true;
+        endTime = deadline;
+        deadline = null;
+      }
+      if (deadline == null && settled && kind !== '作业') return;
+      const detailUrl = decode((part.match(/data="([^"]+)"/) || [])[1] || '');
+      out.push({
+        course: courseName, work: name, kind: kind, status: status, settled: settled,
+        deadline: deadline, noDue: deadline == null, ended: ended, endTime: endTime,
+        detailUrl: kind === '作业' ? detailUrl : ''
+      });
     });
     return out;
   }
+
+  // 作业详情页的「作答时间: 开始 至 结束」。已结束的作业也保留这一段，
+  // 这是列表页之外唯一能拿到结束时间的地方。
+  function parseWorkTimeRange(html) {
+    const raw = String(html || '');
+    const m = raw.match(
+      /作答时间[：:]\s*<em>([^<]+)<\/em>\s*至\s*<em>([^<]+)<\/em>/
+    );
+    if (m) return { start: m[1].trim(), end: m[2].trim() };
+    const text = raw.replace(/<[^>]+>/g, '').replace(/\s+/g, '');
+    const plain = text.match(
+      /作答时间[：:]\s*(20\d{2}-\d{2}-\d{2}\s*\d{2}:\d{2})\s*至\s*(20\d{2}-\d{2}-\d{2}\s*\d{2}:\d{2})/
+    );
+    if (plain) return { start: plain[1], end: plain[2] };
+    return null;
+  }
+
+  function parseDateTimeText(s) {
+    const t = String(s || '').trim().replace(/-/g, '/');
+    if (!t) return null;
+    const ts = new Date(t).getTime();
+    return isNaN(ts) ? null : ts;
+  }
+
+  // 详情页地址换成另一个数据宿主（路径与参数不变）。
+  // 作业详情页也是按课程分片存放的，某个宿主被反爬弃用时要能换一个读。
+  function swapOrigin(url, domain) {
+    try {
+      const u = new URL(String(url));
+      const base = String(domain || '').replace(/\/+$/, '');
+      return base ? base + u.pathname + u.search : String(url);
+    } catch (e) {
+      return String(url);
+    }
+  }
+
+  // 详情页确认结果的缓存：detailUrl → { end: 时间戳 | null }。
+  // 已完成/待批阅的作业在后台确认，后续扫描直接复用，不会每次都重新请求。
+  const workTimeCache = Object.create(null);
+
+  // end == null 表示详情页「作答时间」没有结束时间，也就是确实没有截止时间。
+  // 注意：列表已经标记「已结束」的行不能因此改判为无截止，保持原来的 ended 状态。
+  function applyWorkTime(r, cached, now) {
+    if (!cached) return;
+    if (cached.end == null) {
+      if (!r.ended) {
+        r.endTime = null;
+        r.deadline = null;
+        r.noDue = true;
+      }
+      return;
+    }
+    r.endTime = cached.end;
+    if (cached.end <= now) {
+      r.ended = true;
+      r.deadline = null;
+      r.noDue = false;
+    } else {
+      r.ended = false;
+      r.deadline = cached.end;
+      r.noDue = false;
+    }
+  }
+
+  async function fetchWorkTime(r, label, domains, now) {
+    const origin = hostOf(r.detailUrl) ? 'https://' + hostOf(r.detailUrl) : '';
+    const detailDomains = origin
+      ? [origin].concat((domains || []).filter(function (d) { return d !== origin; }))
+      : domains;
+    const got = await fetchData(function (d) { return swapOrigin(r.detailUrl, d); },
+      label + ' 详情', detailDomains, { primaryHost: origin });
+    if (got.empty) return false;
+    const range = parseWorkTimeRange(got.text);
+    const end = range ? parseDateTimeText(range.end) : null;
+    workTimeCache[r.detailUrl] = { end: end };
+    applyWorkTime(r, workTimeCache[r.detailUrl], now);
+    return true;
+  }
+
+  // 列表页没给时间的未完成作业，逐条进详情页确认：
+  //   · 有结束时间且已过 → 真·已结束，记下 endTime（30 天内且未作答的会进「已结束」分区）；
+  //   · 有结束时间且未到 → 正常带截止时间显示（列表没渲染剩余时间时的兜底）；
+  //   · 详情页没有作答时间 → 确实没有截止时间，保留并标记为无截止。
+  // 「已结束」的条目也要读详情：列表只说状态，结束时间只有详情页有。
+  // 已完成/待批阅的行不在这里同步确认——数量多，会把扫描拖慢，改到扫描结束后后台处理。
+  async function resolveNoDueWorks(list, label, now, domains) {
+    const pending = list.filter(function (r) {
+      return (r.noDue || r.ended) && !r.settled && r.detailUrl;
+    });
+    if (!pending.length) return list;
+    log(label + ' 有 ' + pending.length + ' 条列表未给时间的作业，读取详情页确认截止/结束时间');
+    await mapPool(pending, 3, async function (r) {
+      try {
+        const cached = workTimeCache[r.detailUrl];
+        if (cached && (cached.end != null || !r.ended)) {
+          applyWorkTime(r, cached, now);
+          return;
+        }
+        await fetchWorkTime(r, label, domains, now);
+      } catch (e) {
+        log(label + ' 详情页读取失败：' + r.work + '（' + (e && e.message ? e.message : '失败') + '）');
+      }
+    });
+    const ended = pending.filter(function (r) { return r.ended && r.endTime != null; }).length;
+    const active = pending.filter(function (r) { return !r.ended && r.deadline != null; }).length;
+    const unknown = pending.length - ended - active;
+    log(label + ' 详情页确认：已结束 ' + ended + ' 条，未截止 ' + active + ' 条'
+      + (unknown ? '，仍无时间 ' + unknown + ' 条' : ''));
+    return list;
+  }
+
+  // 把作业拆成「还要提醒的」和「最近 30 天已结束且未作答的」。
+  // 已结束但没有结束时间的（详情页也读不到）既不放进提醒，也不放进已结束分区。
+  function splitEndedWorks(list, now) {
+    const active = [];
+    const ended = [];
+    let older = 0;
+    list.forEach(function (r) {
+      if (!r.ended) {
+        active.push(r);
+        return;
+      }
+      if (r.kind === '作业' && !r.settled && r.endTime != null
+        && r.endTime <= now && r.endTime >= now - THIRTY_DAYS) {
+        ended.push(r);
+      } else {
+        older += 1;
+      }
+    });
+    return { active: active, ended: ended, older: older };
+  }
+
 
   function textOf(match) {
     return match ? decode(match[1].replace(/<[^>]+>/g, '')).trim() : '';
@@ -1084,21 +1459,104 @@
   }
 
   // 三个数据页地址。参数组合与浏览器实测通过的请求一致。
-  function workListUrl(domain, c, p, cpi) {
-    return domain + '/mooc2/work/list?courseId=' + encodeURIComponent(c.courseId)
+  // 第 1 页保持原样；第 2 页起按列表页自身的翻页参数追加
+  // （作业：status=0&pageNum=N&topicId=，浏览器实测第 2 页返回 10 条已完成作业）。
+  function workListUrl(domain, c, p, cpi, page) {
+    const url = domain + '/mooc2/work/list?courseId=' + encodeURIComponent(c.courseId)
       + '&classId=' + encodeURIComponent(c.classId)
       + '&cpi=' + encodeURIComponent(cpi)
       + '&ut=s&t=' + encodeURIComponent(p.t)
       + '&stuenc=' + encodeURIComponent(p.enc)
       + '&enc=' + encodeURIComponent(p.workEnc);
+    if (!page || page <= 1) return url;
+    return url + '&status=0&pageNum=' + page + '&topicId=';
   }
 
-  function examListUrl(domain, c, p, cpi) {
-    return domain + '/exam-ans/mooc2/exam/exam-list?courseid=' + encodeURIComponent(c.courseId)
+  function examListUrl(domain, c, p, cpi, page) {
+    const url = domain + '/exam-ans/mooc2/exam/exam-list?courseid=' + encodeURIComponent(c.courseId)
       + '&clazzid=' + encodeURIComponent(c.classId)
       + '&cpi=' + encodeURIComponent(cpi)
       + '&ut=s&t=' + encodeURIComponent(p.t)
       + '&enc=' + encodeURIComponent(p.examEnc);
+    if (!page || page <= 1) return url;
+    return url + '&status=0&pageNum=' + page + '&openc=';
+  }
+
+  // 列表页内联的分页脚本：$("#page").paging({nowPage:1, pageNum:2, ...})。
+  // 只有一页时 .pageDiv 是空的、脚本里也没有 paging 调用，按 1 页处理。
+  function parsePagerTotal(html) {
+    const s = String(html || '');
+    const m = s.match(/pageNum\s*:\s*(\d+)/)
+      || s.match(/pageCount\s*:\s*(\d+)/)
+      || s.match(/totalPage\s*:\s*(\d+)/);
+    let total = m ? Number(m[1]) : 0;
+    if (!total) {
+      try {
+        const doc = new DOMParser().parseFromString(s, 'text/html');
+        doc.querySelectorAll('.pageDiv li, #page li, .pageDiv a, #page a').forEach(function (el) {
+          const n = Number((el.textContent || '').trim());
+          if (n >= 1 && n < 1000) total = Math.max(total, n);
+        });
+      } catch (e) { total = 0; }
+    }
+    if (!isFinite(total) || total < 1) total = 1;
+    return Math.min(total, MAX_LIST_PAGES);
+  }
+
+  // 翻页后同一门课里可能有重复条目（列表排序变化时尤其常见），按内容去重。
+  function dedupeRows(list) {
+    const seen = {};
+    const out = [];
+    list.forEach(function (r) {
+      const key = r.kind + '|' + r.work + '|' + r.status + '|' + (r.detailUrl || '');
+      if (seen[key]) return;
+      seen[key] = 1;
+      out.push(r);
+    });
+    return out;
+  }
+
+  // 先读第 1 页，再按分页脚本给出的总页数逐页补齐。
+  // 后续页固定用第 1 页实际落地的域名（同一门课的数据分片在同一个宿主上），
+  // 某个后续页失败时标记 partial，交给整轮重试补读，而不是静默少几条。
+  async function fetchPaged(buildUrl, label, domains, opts, parse, now) {
+    const rows = [];
+    let totalPages = 1;
+    let partial = false;
+    let empty = false;
+    let pageHost = '';
+    for (let page = 1; page <= totalPages; page++) {
+      const hostBase = pageHost ? 'https://' + pageHost : '';
+      const list = hostBase
+        ? [hostBase].concat((domains || []).filter(function (d) { return hostOf(d) !== pageHost; }))
+        : domains;
+      const pageOpts = hostBase
+        ? { primaryHost: hostBase, hintLimit: opts && opts.hintLimit }
+        : opts;
+      let got;
+      try {
+        got = await fetchData(function (d) { return buildUrl(d, page); },
+          page === 1 ? label : (label + ' 第' + page + ' 页'), list, pageOpts);
+      } catch (e) {
+        if (page === 1) throw e;
+        partial = true;
+        log(label + ' 第 ' + page + ' 页读取失败：'
+          + (e && e.message ? e.message : '失败') + '（标记待重试）');
+        break;
+      }
+      if (got.empty) {
+        if (page === 1) empty = true;
+        break;
+      }
+      if (page === 1) {
+        totalPages = parsePagerTotal(got.text);
+        if (totalPages > 1) log(label + ' 列表共 ' + totalPages + ' 页，继续读取后续页');
+      }
+      const landed = hostOf(got.url);
+      if (landed) pageHost = landed;
+      rows.push.apply(rows, parse(got.text, now));
+    }
+    return { rows: dedupeRows(rows), pages: totalPages, partial: partial, empty: empty };
   }
 
   function chapterUrl(c, p, cpi, domain) {
@@ -1120,7 +1578,7 @@
   // 并行之后每门课只有 2 步（门户 → 三个数据页同时），耗时明显下降。
   async function loadCourse(course, idx, opts) {
     opts = opts || {};
-    const out = { work: null, exam: null, chapter: null, failed: [], portal: null, noData: false };
+    const out = { work: null, workEnded: null, exam: null, chapter: null, failed: [], portal: null, noData: false, pendingSettled: [] };
     if (course.ended) return out;
     const p = opts.portal || await openPortal(course, idx);
     out.portal = p;
@@ -1135,12 +1593,35 @@
       const label = '[' + course.name + '] 作业列表';
       jobs.push((async function () {
         try {
-          const got = await fetchData(function (d) { return workListUrl(d, course, p, cpi); },
-            label, dlist, { primaryHost: p.host });
-          out.work = parseTasks(got.text, course.name, '作业', now);
+          const got = await fetchPaged(function (d, page) { return workListUrl(d, course, p, cpi, page); },
+            label, dlist, { primaryHost: p.host },
+            function (text, n) { return parseTasks(text, course.name, '作业', n); }, now);
           if (got.empty) out.noData = true;
-          log(label + ' 解析出 ' + out.work.length + ' 条'
-            + (out.work.length ? ' 首条=' + out.work[0].work + ' ' + out.work[0].status : ''));
+          if (got.partial) out.failed.push('work');
+          const resolved = await resolveNoDueWorks(got.rows, label, now, dlist);
+          // 已完成/待批阅且列表没给时间的作业：能命中缓存就直接采用，
+          // 其余的留到扫描结束后后台确认，避免几百个详情请求把本轮拖慢。
+          const pendingSettled = [];
+          resolved.forEach(function (r) {
+            if (!r.settled || !r.noDue || !r.detailUrl) return;
+            const cached = workTimeCache[r.detailUrl];
+            if (cached) {
+              applyWorkTime(r, cached, now);
+            } else {
+              // 先不显示：列表没给时间不等于没有截止时间，等后台确认后再补进来。
+              r.pendingConfirm = true;
+              pendingSettled.push(r);
+            }
+          });
+          const split = splitEndedWorks(resolved.filter(function (r) { return !r.pendingConfirm; }), now);
+          out.work = split.active;
+          out.workEnded = split.ended;
+          out.pendingSettled = pendingSettled;
+          if (split.older) log(label + ' 另有 ' + split.older + ' 条已结束（含已完成/待批阅）或结束时间未知，不列出');
+          log(label + ' 解析出未截止 ' + out.work.length + ' 条，最近30天已结束未作答 '
+            + out.workEnded.length + ' 条（共 ' + got.pages + ' 页）'
+            + (out.work.length ? ' 首条=' + out.work[0].work + ' ' + out.work[0].status : '')
+            + (pendingSettled.length ? '，另有 ' + pendingSettled.length + ' 条已完成/待批阅待后台确认' : ''));
         } catch (e) {
           out.failed.push('work');
           log(label + ' 失败: ' + (e && e.message ? e.message : '失败'));
@@ -1151,11 +1632,14 @@
       const label = '[' + course.name + '] 考试列表';
       jobs.push((async function () {
         try {
-          const got = await fetchData(function (d) { return examListUrl(d, course, p, cpi); },
-            label, dlist, { primaryHost: p.host });
-          out.exam = parseTasks(got.text, course.name, '考试', now);
+          const got = await fetchPaged(function (d, page) { return examListUrl(d, course, p, cpi, page); },
+            label, dlist, { primaryHost: p.host },
+            function (text, n) { return parseTasks(text, course.name, '考试', n); }, now);
+          // 已结束的考试没有「最近结束」分区，也没有可查看的结束时间，直接排除。
+          out.exam = got.rows.filter(function (r) { return !r.ended; });
           if (got.empty) out.noData = true;
-          log(label + ' 解析出 ' + out.exam.length + ' 条');
+          if (got.partial) out.failed.push('exam');
+          log(label + ' 解析出 ' + out.exam.length + ' 条（共 ' + got.pages + ' 页）');
         } catch (e) {
           out.failed.push('exam');
           log(label + ' 失败: ' + (e && e.message ? e.message : '失败'));
@@ -1204,18 +1688,46 @@
     return s;
   }
 
+  function pad2(n) {
+    return (n < 10 ? '0' : '') + n;
+  }
+
+  function formatDate(ms) {
+    const d = new Date(ms);
+    return d.getFullYear() + '-' + pad2(d.getMonth() + 1) + '-' + pad2(d.getDate())
+      + ' ' + pad2(d.getHours()) + ':' + pad2(d.getMinutes());
+  }
+
+  function formatAgo(ms, now) {
+    const diff = Math.max(0, now - ms);
+    const days = Math.floor(diff / 86400000);
+    if (days >= 1) return days + '天前';
+    const hours = Math.floor(diff / 3600000);
+    return (hours >= 1 ? hours + '小时前' : Math.max(1, Math.floor(diff / 60000)) + '分钟前');
+  }
+
   function render() {
     const now = Date.now();
-    const sorted = rows.slice().sort(function (a, b) { return a.deadline - b.deadline; });
+    // 有截止时间的按时间升序；无截止时间的排在后面（未完成优先于已完成）。
+    const sorted = rows.slice().sort(function (a, b) {
+      const an = a.deadline == null ? Infinity : a.deadline;
+      const bn = b.deadline == null ? Infinity : b.deadline;
+      if (an !== bn) return an - bn;
+      if (an === Infinity && a.settled !== b.settled) return a.settled ? 1 : -1;
+      return 0;
+    });
     const chapters = chapterRows.slice().sort(function (a, b) {
       const ae = a.endMs == null ? Infinity : a.endMs;
       const be = b.endMs == null ? Infinity : b.endMs;
       return ae - be;
     });
-    const hot = sorted.filter(function (r) { return r.deadline - now < SEVEN_DAYS; }).length;
+    const noDueCount = sorted.filter(function (r) { return r.deadline == null; }).length;
+    const hot = sorted.filter(function (r) { return r.deadline != null && r.deadline - now < SEVEN_DAYS; }).length;
+    const endedPart = endedRows.length ? ' · 已结束 ' + endedRows.length : '';
     titleEl.textContent = (minimized
-      ? ('未截止 ' + sorted.length + ' · 章节 ' + chapters.length)
-      : ('未截止 ' + sorted.length + ' 项 · 未看完章节 ' + chapters.length)) + ' v' + VERSION;
+      ? ('未截止 ' + sorted.length + endedPart + ' · 章节 ' + chapters.length)
+      : ('未截止 ' + sorted.length + ' 项' + endedPart + ' · 未看完章节 '
+        + chapters.length)) + ' v' + VERSION;
     const seen = {};
     const courses = [];
     chapters.forEach(function (r) {
@@ -1223,18 +1735,38 @@
       seen[r.course] = 1;
       courses.push(r);
     });
-    const html = ['<div class="cx-col"><div class="cx-sec">作业 / 考试</div>'];
+    const html = ['<div class="cx-col"><div class="cx-sec">作业 / 考试'
+      + (noDueCount ? '（无截止 ' + noDueCount + '）' : '') + '</div>'];
     if (!sorted.length) {
       html.push('<div class="cx-empty">没有还没截止的</div>');
     } else {
-      html.push('<table><thead><tr><th>课程</th><th>名称</th><th>还剩</th></tr></thead><tbody>');
+      html.push('<table class="cx-tasks"><thead><tr><th>课程</th><th>名称</th><th>还剩</th></tr></thead><tbody>');
       sorted.forEach(function (r) {
-        const left = r.deadline - now;
-        const cls = r.settled ? ' class="cx-ok"' : (left < SEVEN_DAYS ? ' class="cx-hot"' : '');
+        const left = r.deadline == null ? null : r.deadline - now;
+        let cls = '';
+        if (r.settled) cls = ' class="cx-ok"';
+        else if (left == null) cls = ' class="cx-nodue"';
+        else if (left < SEVEN_DAYS) cls = ' class="cx-hot"';
         html.push(
           '<tr' + cls + '><td class="cx-name">' + escapeHtml(r.course) + '</td><td class="cx-work"><span class="cx-kind">[' + r.kind + ']</span>'
-          + escapeHtml(r.work) + ' ' + (r.settled ? '已完成' : '未完成') + '</td><td>' + formatRemain(left) + '</td></tr>'
+          + escapeHtml(r.work) + ' ' + (r.settled ? '已完成' : '未完成') + '</td><td>'
+          + (left == null ? '无截止时间' : formatRemain(left)) + '</td></tr>'
         );
+      });
+      html.push('</tbody></table>');
+    }
+    if (endedRows.length) {
+      const endedSorted = endedRows.slice().sort(function (a, b) {
+        return (b.endTime || 0) - (a.endTime || 0);
+      });
+      html.push('<div class="cx-sec cx-sub">最近30天已结束（未作答）</div>');
+      html.push('<table class="cx-ended"><thead><tr><th>课程</th><th>名称</th><th>结束于</th></tr></thead><tbody>');
+      endedSorted.forEach(function (r) {
+        html.push('<tr class="cx-ended"><td class="cx-name">' + escapeHtml(r.course) + '</td>'
+          + '<td class="cx-work"><span class="cx-kind">[' + r.kind + ']</span>'
+          + escapeHtml(r.work) + ' ' + escapeHtml(r.status || '未交') + '</td>'
+          + '<td>' + formatDate(r.endTime)
+          + '<span class="cx-status">' + formatAgo(r.endTime, now) + '</span></td></tr>');
       });
       html.push('</tbody></table>');
     }
@@ -1242,7 +1774,7 @@
     if (!courses.length) {
       html.push('<div class="cx-empty">没有未看完的课</div>');
     } else {
-      html.push('<table><thead><tr><th>课程名称</th><th>课程还剩</th></tr></thead><tbody>');
+      html.push('<table class="cx-chapters"><thead><tr><th>课程名称</th><th>课程还剩</th></tr></thead><tbody>');
       courses.forEach(function (r) {
         const leftText = r.endMs == null ? '未显示结课时间' : formatRemain(r.endMs - now);
         html.push('<tr><td class="cx-name">' + escapeHtml(r.course) + '</td><td>' + leftText + '</td></tr>');
@@ -1269,6 +1801,71 @@
     return ret;
   }
 
+  // 扫描结束后的后台确认：已完成/待批阅且列表没给时间的作业才需要读详情。
+  // 放到后台跑，扫描出结果的耗时不受影响；确认出的行再补进列表。
+  // 每轮最多确认 120 条，避免老课程积压的已完成作业把后台请求量拉得太大；
+  // 已确认过的会进缓存，下一轮自然轮到后面的。
+  const MAX_SETTLED_CONFIRM = 120;
+  async function confirmSettledRows(list, gen) {
+    if (!list.length || gen !== scanGen) return;
+    const seen = {};
+    const unique = list.filter(function (r) {
+      if (!r || !r.detailUrl || seen[r.detailUrl]) return false;
+      seen[r.detailUrl] = 1;
+      return true;
+    });
+    const pending = unique.slice(0, MAX_SETTLED_CONFIRM);
+    if (unique.length > pending.length) {
+      log('已完成/待批阅作业共 ' + unique.length + ' 条，本轮后台只确认前 ' + pending.length
+        + ' 条，其余下次扫描继续');
+    }
+    if (!pending.length) return;
+    log('后台确认 ' + pending.length + ' 条已完成/待批阅作业的截止时间（不影响本轮结果）');
+    const found = [];
+    let lastFlush = Date.now();
+
+    function flush() {
+      if (gen !== scanGen) return;
+      let added = 0;
+      found.slice().forEach(function (r) {
+        if (rows.indexOf(r) < 0) {
+          rows.push(r);
+          added += 1;
+        }
+      });
+      found.length = 0;
+      if (added) {
+        render();
+        log('后台确认新增 ' + added + ' 条已完成/待批阅作业（无截止时间或还未到期）');
+      }
+    }
+
+    await mapPool(pending, 6, async function (r) {
+      if (gen !== scanGen) return;
+      const origin = hostOf(r.detailUrl) ? 'https://' + hostOf(r.detailUrl) : '';
+      try {
+        const cached = workTimeCache[r.detailUrl];
+        if (cached) applyWorkTime(r, cached, Date.now());
+        else await fetchWorkTime(r, '[' + r.course + '] 作业',
+          dataDomains(origin, 0, origin), Date.now());
+      } catch (e) {
+        // 后台确认失败就算了，下一轮扫描会重新排队
+      }
+      // 只有真正读到详情页的才采用，避免把「没读到」误当成「无截止」。
+      if (workTimeCache[r.detailUrl] && r.settled && !r.ended) {
+        r.pendingConfirm = false;
+        found.push(r);
+      }
+      if (found.length && Date.now() - lastFlush > 800) {
+        lastFlush = Date.now();
+        flush();
+      }
+    });
+    if (gen !== scanGen) return;
+    flush();
+    log('后台确认完成：共检查 ' + pending.length + ' 条已完成/待批阅作业');
+  }
+
   let scanGen = 0;
 
   async function scan() {
@@ -1277,6 +1874,7 @@
     const courses = coursesFromPage();
     if (!courses.length) {
       rows = [];
+      endedRows = [];
       chapterRows = [];
       titleEl.textContent = '没有课程';
       bodyEl.innerHTML = '<div class="cx-empty">当前筛选下没有课程</div>';
@@ -1312,7 +1910,7 @@
     if (!courses.length) probePage();
     titleEl.textContent = '正在读取 0/' + courses.length;
     bodyEl.innerHTML = '<div class="cx-empty">正在逐门读取作业、考试和章节…</div>';
-    footEl.textContent = '左：7天内未完成标红，已完成或待批改且还有剩余时间标绿。右：未看完课程';
+    footEl.textContent = '左：7天内未完成标红，已完成或待批改且还有剩余时间标绿，最近30天已结束单列。右：未看完课程';
     // 结果按课程存，重试时覆盖（而不是追加），避免同一门课的数据重复计入
     const results = {};
     const keyOf = function (c) { return c.courseId + ':' + c.classId; };
@@ -1330,7 +1928,7 @@
       } catch (err) {
         const msg = err && err.message ? err.message : '失败';
         errors.push(course.name + '：' + msg);
-        results[keyOf(course)] = { work: null, exam: null, chapter: null, failed: ['portal'], portal: null, noData: false };
+        results[keyOf(course)] = { work: null, workEnded: null, exam: null, chapter: null, failed: ['portal'], portal: null, noData: false, pendingSettled: [] };
         retryList.push(course);
         log('[' + course.name + '] 失败：' + msg);
       }
@@ -1363,11 +1961,13 @@
           const want = function (k) { return portalFailed || prev.failed.indexOf(k) >= 0; };
           results[keyOf(course)] = {
             work: want('work') ? pack.work : prev.work,
+            workEnded: want('work') ? pack.workEnded : prev.workEnded,
             exam: want('exam') ? pack.exam : prev.exam,
             chapter: want('chapter') ? pack.chapter : prev.chapter,
             failed: pack.failed,
             noData: !!(prev.noData || pack.noData),
-            portal: pack.portal || prev.portal
+            portal: pack.portal || prev.portal,
+            pendingSettled: want('work') ? pack.pendingSettled : prev.pendingSettled
           };
           const r = results[keyOf(course)];
           log('[' + course.name + '] 重试完成：作业/考试 '
@@ -1382,26 +1982,34 @@
     if (gen !== scanGen) return;
     // 汇总：每门课只贡献一次
     const nextRows = [];
+    const nextEnded = [];
     const nextChapters = [];
+    const nextSettled = [];
     let noDataCount = 0;
     let partialCount = 0;
     courses.forEach(function (c) {
       const r = results[keyOf(c)];
       if (!r) return;
       if (r.work) nextRows.push.apply(nextRows, r.work);
+      if (r.workEnded) nextEnded.push.apply(nextEnded, r.workEnded);
       if (r.exam) nextRows.push.apply(nextRows, r.exam);
       if (r.chapter) nextChapters.push.apply(nextChapters, r.chapter);
+      if (r.pendingSettled) nextSettled.push.apply(nextSettled, r.pendingSettled);
       // 「没有数据」和「读取失败」是两回事，汇总里必须分开报
       if (r.noData) noDataCount += 1;
       if (r.failed && r.failed.length) partialCount += 1;
     });
     rows = nextRows;
+    endedRows = nextEnded;
     chapterRows = nextChapters;
     loading = false;
     setScanBtn('↻ 重新扫描', false);
     render();
     const secs = ((Date.now() - t0) / 1000).toFixed(1);
-    log('===== 扫描结束：作业/考试 ' + nextRows.length + ' 条，未完成章节 '
+    const noDueCount = nextRows.filter(function (r) { return r.deadline == null; }).length;
+    log('===== 扫描结束：作业/考试 ' + nextRows.length + ' 条'
+      + (noDueCount ? '（其中无截止时间 ' + noDueCount + ' 条）' : '')
+      + '，最近30天已结束未作答 ' + nextEnded.length + ' 条，未完成章节 '
       + nextChapters.length + ' 个，无数据 ' + noDataCount + ' 门，部分失败 ' + partialCount
       + ' 门，读取失败 ' + errors.length + ' 门，用时 ' + secs
       + ' 秒（v' + VERSION + '，' + courses.length + ' 门课） =====');
@@ -1415,11 +2023,13 @@
       }).join(' ') || '无'));
     footEl.textContent = errors.length
       ? ('有 ' + errors.length + ' 门没读全，点 ☰ 看详细日志')
-      : '按住蓝条拖动。课程页会按当前学期筛选结果读取。不足7天且未完成标红。';
+      : '拖动蓝条移动、拖边框调整大小。7天内未完成标红，无截止时间标橙，已完成/待批阅标绿，最近30天已结束单列。';
+    // 后台补查不 await：结果已经渲染完，确认出来的「无截止/未到期」作业会陆续补进列表。
+    confirmSettledRows(nextSettled, gen);
   }
 
   setInterval(function () {
-    if (!loading && (rows.length || chapterRows.length)) render();
+    if (!loading && (rows.length || endedRows.length || chapterRows.length)) render();
   }, 30000);
 
   // v2.5.0：不再自动扫描。
