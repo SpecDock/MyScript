@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Selection Translator
 // @namespace    specdock.my-script.selection-translator
-// @version      1.2.0
-// @description  静默划词翻译：中文→英文，其他→中文。Google → Microsoft → LLM 自动回退；可视化设置面板；GitHub 版本检测与一键更新。
+// @version      1.3.0
+// @description  静默划词翻译：中文→英文，其他→中文。Google → Microsoft → 腾讯翻译 → MyMemory → LLM 多级自动回退；可视化设置面板；GitHub 版本检测与一键更新。
 // @author       SpecDock
 // @match        *://*/*
 // @run-at       document-idle
@@ -15,6 +15,8 @@
 // @connect      translate.googleapis.com
 // @connect      edge.microsoft.com
 // @connect      api-edge.cognitive.microsofttranslator.com
+// @connect      transmart.qq.com
+// @connect      api.mymemory.translated.net
 // @connect      raw.githubusercontent.com
 // @connect      cdn.jsdelivr.net
 // @connect      api.github.com
@@ -30,7 +32,7 @@
 
   const SCRIPT_NAME = 'Selection Translator';
   const SCRIPT_NS = 'specdock.my-script.selection-translator';
-  const FALLBACK_VERSION = '1.2.0';
+  const FALLBACK_VERSION = '1.3.0';
   const SCRIPT_VERSION = (() => {
     try {
       return (typeof GM_info !== 'undefined' && GM_info.script && GM_info.script.version) || FALLBACK_VERSION;
@@ -42,11 +44,15 @@
     try { return window.top === window; } catch (e) { return false; }
   })();
 
-  const ENGINE_ORDER = ['google', 'ms', 'llm'];
+  const ENGINE_ORDER = ['google', 'ms', 'tencent', 'mymemory', 'llm'];
   const GOOGLE_TIMEOUT = 1500;
   const MS_TOKEN_TIMEOUT = 1800;
   const MS_TIMEOUT = 3000;
+  const TENCENT_TIMEOUT = 2500;
+  const MYMEMORY_TIMEOUT = 2500;
   const LLM_TIMEOUT = 20000;
+  const TENCENT_URL = 'https://transmart.qq.com/api/imt';
+  const TENCENT_CLIENT_KEY = 'browser-chrome-120.0.0.0-Windows-6f1c2c9e-3f0b-4c3e-9d1a-2b7e5c8f4a11';
   const DOWN_MS = 5 * 60 * 1000;
   const MAX_LEN = 2500;
   const BUBBLE_GAP = 8;
@@ -68,6 +74,7 @@
     llmKey: 'st.llm.key',
     llmModel: 'st.llm.model',
     msToken: 'st.ms.token',
+    enginesDown: 'st.engines.down',
     updateState: 'st.update.state',
     updateHide: 'st.update.hide',
   };
@@ -78,7 +85,18 @@
     model: String(GM_getValue(K.llmModel, 'deepseek-flash') || 'deepseek-flash'),
   };
 
-  const downUntil = Object.create(null);
+  const downUntil = (() => {
+    const out = Object.create(null);
+    const now = Date.now();
+    const saved = GM_getValue(K.enginesDown, null);
+    if (saved && typeof saved === 'object') {
+      for (const name of Object.keys(saved)) {
+        const at = Number(saved[name]);
+        if (at > now && at <= now + DOWN_MS) out[name] = at;
+      }
+    }
+    return out;
+  })();
   const inflight = new Map();
   const cache = new Map();
   let msToken = '';
@@ -329,6 +347,54 @@
     }
   }
 
+  async function tencentTranslate(text, target) {
+    const body = {
+      header: { fn: 'auto_translation', client_key: TENCENT_CLIENT_KEY },
+      type: 'plain',
+      model_category: 'normal',
+      source: { lang: 'auto', text_list: [text] },
+      target: { lang: target === 'en' ? 'en' : 'zh' },
+    };
+    const res = await gmRequest({
+      url: TENCENT_URL,
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      data: JSON.stringify(body),
+      timeout: TENCENT_TIMEOUT,
+    });
+    if (res.status !== 200) throw new Error('tencent http ' + res.status);
+    let data;
+    try {
+      data = JSON.parse(res.responseText);
+    } catch (e) {
+      throw new Error('tencent parse');
+    }
+    const out = data && Array.isArray(data.auto_translation) ? String(data.auto_translation[0] || '').trim() : '';
+    if (!out) throw new Error('tencent empty');
+    return { text: out, detected: typeof data.src_lang === 'string' ? data.src_lang : '' };
+  }
+
+  async function myMemoryTranslate(text, target) {
+    // 免费接口仅支持 500 字节内的明确语种对，超长或非中英语种直接交给 LLM
+    if (text.length > 400) throw new Error('mymemory too long');
+    if (target === 'zh' && !/[A-Za-z]/.test(text)) throw new Error('mymemory source unknown');
+    const pair = target === 'en' ? 'zh-CN|en' : 'en|zh-CN';
+    const url = 'https://api.mymemory.translated.net/get?q=' + encodeURIComponent(text) + '&langpair=' + encodeURIComponent(pair);
+    const res = await gmRequest({ url, timeout: MYMEMORY_TIMEOUT });
+    if (res.status !== 200) throw new Error('mymemory http ' + res.status);
+    let data;
+    try {
+      data = JSON.parse(res.responseText);
+    } catch (e) {
+      throw new Error('mymemory parse');
+    }
+    const out = data && data.responseData && typeof data.responseData.translatedText === 'string'
+      ? data.responseData.translatedText.trim()
+      : '';
+    if (!out || Number(data.responseStatus) !== 200) throw new Error('mymemory empty');
+    return { text: out, detected: target === 'en' ? 'zh' : 'en' };
+  }
+
   function llmReady() {
     return !!(cfg.url && cfg.key);
   }
@@ -386,6 +452,8 @@
   const ENGINES = {
     google: googleTranslate,
     ms: msTranslate,
+    tencent: tencentTranslate,
+    mymemory: myMemoryTranslate,
     llm: llmTranslate,
   };
 
@@ -404,6 +472,27 @@
     }
   }
 
+  function saveDownState() {
+    const now = Date.now();
+    const out = {};
+    for (const name of Object.keys(downUntil)) {
+      if (downUntil[name] > now) out[name] = downUntil[name];
+      else delete downUntil[name];
+    }
+    try { GM_setValue(K.enginesDown, out); } catch (e) {}
+  }
+
+  function markDown(name) {
+    downUntil[name] = Date.now() + DOWN_MS;
+    saveDownState();
+  }
+
+  function markUp(name) {
+    if (!(name in downUntil)) return;
+    delete downUntil[name];
+    saveDownState();
+  }
+
   async function runChain(text, target) {
     let lastErr = null;
     for (const name of ENGINE_ORDER) {
@@ -413,10 +502,10 @@
       try {
         const res = await ENGINES[name](text, target);
         if (!res || !res.text) throw new Error('empty');
-        delete downUntil[name];
+        markUp(name);
         return res;
       } catch (e) {
-        downUntil[name] = Date.now() + DOWN_MS;
+        markDown(name);
         lastErr = e;
       }
     }
@@ -1246,7 +1335,7 @@
     head.appendChild(btnMin);
     head.appendChild(btnClose);
 
-    const sub = make('p', 'sub', 'Google → Microsoft → LLM 自动回退。配置仅保存在篡改猴本地。');
+    const sub = make('p', 'sub', 'Google → Microsoft → 腾讯翻译 → MyMemory → LLM 自动回退。配置仅保存在篡改猴本地。');
 
     const urlField = make('div', 'field');
     const urlRow = make('div', 'label-row');
@@ -1540,24 +1629,20 @@
       ? (fn => window.requestIdleCallback(fn, { timeout: 4000 }))
       : (fn => setTimeout(fn, 1200));
     idle(() => {
-      googleTranslate('hello', 'zh').then(() => {
-        delete downUntil.google;
-      }).catch(() => {
-        downUntil.google = Date.now() + DOWN_MS;
-      });
-      getMsToken()
-        .then(() => msTranslate('hi', 'zh'))
-        .then(() => {
-          delete downUntil.ms;
-        })
-        .catch(() => {
-          downUntil.ms = Date.now() + DOWN_MS;
-        });
+      if (!(downUntil.google > Date.now())) {
+        googleTranslate('hello', 'zh').then(() => markUp('google')).catch(() => markDown('google'));
+      }
+      if (!(downUntil.ms > Date.now())) {
+        getMsToken()
+          .then(() => msTranslate('hi', 'zh'))
+          .then(() => markUp('ms'))
+          .catch(() => markDown('ms'));
+      }
     });
   }
 
   function resetLlmFailure() {
-    delete downUntil.llm;
+    markUp('llm');
   }
 
   function menu(label, fn) {
