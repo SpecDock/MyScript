@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Selection Translator
 // @namespace    specdock.my-script.selection-translator
-// @version      1.3.0
+// @version      1.3.1
 // @description  静默划词翻译：中文→英文，其他→中文。Google → Microsoft → 腾讯翻译 → MyMemory → LLM 多级自动回退；可视化设置面板；GitHub 版本检测与一键更新。
 // @author       SpecDock
 // @match        *://*/*
@@ -32,7 +32,7 @@
 
   const SCRIPT_NAME = 'Selection Translator';
   const SCRIPT_NS = 'specdock.my-script.selection-translator';
-  const FALLBACK_VERSION = '1.3.0';
+  const FALLBACK_VERSION = '1.3.1';
   const SCRIPT_VERSION = (() => {
     try {
       return (typeof GM_info !== 'undefined' && GM_info.script && GM_info.script.version) || FALLBACK_VERSION;
@@ -375,9 +375,18 @@
   }
 
   async function myMemoryTranslate(text, target) {
-    // 免费接口仅支持 500 字节内的明确语种对，超长或非中英语种直接交给 LLM
-    if (text.length > 400) throw new Error('mymemory too long');
-    if (target === 'zh' && !/[A-Za-z]/.test(text)) throw new Error('mymemory source unknown');
+    // 免费接口单次上限约 500 字节，且只支持明确的中英语种对；不满足时跳过但不熔断
+    const bytes = typeof TextEncoder === 'function' ? new TextEncoder().encode(text).length : text.length;
+    if (bytes > 480) {
+      const err = new Error('mymemory too long');
+      err.skipDown = true;
+      throw err;
+    }
+    if (target === 'zh' && !/[A-Za-z]/.test(text)) {
+      const err = new Error('mymemory source unknown');
+      err.skipDown = true;
+      throw err;
+    }
     const pair = target === 'en' ? 'zh-CN|en' : 'en|zh-CN';
     const url = 'https://api.mymemory.translated.net/get?q=' + encodeURIComponent(text) + '&langpair=' + encodeURIComponent(pair);
     const res = await gmRequest({ url, timeout: MYMEMORY_TIMEOUT });
@@ -505,7 +514,7 @@
         markUp(name);
         return res;
       } catch (e) {
-        markDown(name);
+        if (!e.skipDown) markDown(name);
         lastErr = e;
       }
     }
