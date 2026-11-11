@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         学堂在线自动刷课 + AI 自动做题
 // @namespace    https://www.xuetangx.com/
-// @version      1.6.0
+// @version      1.7.0
 // @description  通用版：自动刷视频进度（真静音、暂停自动续播）；进到章节作业后自动提取题目、请求 AI、选择答案并真实提交，提交后页面自动切到下一题（支持单选 / 多选 / 判断题）。腾讯点选文字验证码自动识别（需支持视觉的模型）。以当前所在页面为准，换任何一门课都能直接用。
 // @author       local
 // @match        https://www.xuetangx.com/*
@@ -11,6 +11,10 @@
 // @grant        GM_setValue
 // @grant        GM_getValue
 // @grant        GM_deleteValue
+// @grant        GM_openInTab
+// @updateURL    https://raw.githubusercontent.com/SpecDock/MyScript/master/学堂在线刷课AI做题.user.js
+// @downloadURL  https://raw.githubusercontent.com/SpecDock/MyScript/master/学堂在线刷课AI做题.user.js
+// @supportURL   https://github.com/SpecDock/MyScript/issues
 // @connect      *
 // @run-at       document-start
 // ==/UserScript==
@@ -71,6 +75,32 @@ const CONFIG = {
 
   // 进入页面后是否自动开始
   AUTO_START: false,
+};
+
+/* ---------------------------------------------------------------------------
+ * GitHub 自动更新
+ * ---------------------------------------------------------------------------
+ * 油猴（Tampermonkey 5.x）的原生更新机制：
+ *   ① 油猴会定期去 @updateURL 拉脚本，比较 @version；发现更高版本就下载 @downloadURL 并安装。
+ *      油猴默认设置里 `scriptUpdateAutomaticInstall = true`（自动安装），
+ *      检查间隔默认 24 小时，可以在 油猴 → 设置 → 常规 → 脚本更新 里改成「每次运行」。
+ *   ② 但油猴**接管 URL**（即"点链接直接弹出安装/更新页"）只认结尾是 `.user.js` / `.tamper.js` 的地址
+ *      （实测油猴 5.5.1 源码里的判定：/[^/]{1}\.user\.(js#|js\?|js$)/）。
+ *      所以仓库里的文件名必须是 .user.js 结尾，面板里的「更新」按钮才能一键交给油猴。
+ *
+ * 因此配两个地址：
+ *   url         —— 主地址（仓库文件改名后的 .user.js），和 @updateURL / @downloadURL 保持一致
+ *   fallbackUrl —— 旧文件名（.txt），改名完成前仍然能用（面板照样能查到版本）
+ * ------------------------------------------------------------------------- */
+const UPDATE = {
+  // 主地址：仓库里文件名改成 *.user.js 之后的地址（必须和元数据里的 @updateURL / @downloadURL 一致）
+  url: "https://raw.githubusercontent.com/SpecDock/MyScript/master/学堂在线刷课AI做题.user.js",
+  // 兜底地址：改名之前的旧文件名。改名还没做完时，面板照样能查到远程版本
+  fallbackUrl: "https://raw.githubusercontent.com/SpecDock/MyScript/master/学堂在线刷课AI做题.txt",
+  // 仓库主页（降级指引里给用户点）
+  repoUrl: "https://github.com/SpecDock/MyScript",
+  // 两次自动检查之间的最小间隔（毫秒），避免每次翻页都打一次 GitHub
+  checkIntervalMs: 5 * 60 * 1000,
 };
 
 /* =========================================================================
@@ -217,7 +247,8 @@ function ensurePanel() {
         flex:1;min-width:0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
       #xtx-bot-panel .xtx-statusrow{display:flex;align-items:center;gap:8px}
       #xtx-bot-panel .xtx-link{flex:none;border:0;background:transparent;color:#94A3B8;
-        font:11px/1.4 inherit;cursor:pointer;padding:3px 6px;border-radius:6px;
+        font:11px/1.4 inherit;cursor:pointer;padding:6px 8px;border-radius:8px;
+        min-height:24px;display:inline-flex;align-items:center;
         transition:color .16s ease,background .16s ease}
       #xtx-bot-panel .xtx-link:hover{color:#F8FAFC;background:#1E293B}
       #xtx-bot-panel .xtx-link:focus-visible{outline:2px solid #22C55E;outline-offset:1px}
@@ -226,11 +257,59 @@ function ensurePanel() {
         border:1px solid #1E293B;border-radius:8px;padding:8px;white-space:pre-wrap;
         word-break:break-word;font:11px/1.6 ui-monospace,"Cascadia Code",Consolas,monospace;
         color:#CBD5E1}
+      /* ---- 版本徽章（标题栏） ---- */
+      #xtx-bot-panel .xtx-ver{flex:none;font:500 10px/1 ui-monospace,"Cascadia Code",Consolas,monospace;
+        letter-spacing:.3px;color:#94A3B8;background:#0B1220;border:1px solid #1E293B;
+        border-radius:6px;padding:4px 8px;transition:color .16s ease,border-color .16s ease}
+      #xtx-bot-panel .xtx-ver.has-update{color:#22C55E;border-color:rgba(34,197,94,.45)}
+      /* 有新版时：颜色之外再加"圆点 + ↑"两个非颜色线索（颜色不能是唯一区分手段，
+         色觉障碍用户和快速扫一眼的用户都要能看出来）。最小化后徽章仍然可见。 */
+      #xtx-bot-panel .xtx-ver.has-update::before{content:"";display:inline-block;
+        width:5px;height:5px;border-radius:50%;background:#22C55E;margin-right:5px;vertical-align:1px}
+      /* ---- 更新横幅 ---- */
+      #xtx-bot-panel .xtx-upd{display:flex;align-items:center;gap:8px;padding:8px 12px;
+        border-bottom:1px solid #1E293B;background:#131E33}
+      #xtx-bot-panel .xtx-upd[hidden]{display:none}
+      #xtx-bot-panel.xtx-collapsed .xtx-upd{display:none}
+      #xtx-bot-panel .xtx-upd-ico{flex:none;width:24px;height:24px;display:grid;place-items:center;
+        border-radius:7px;background:#1E293B;color:#94A3B8}
+      #xtx-bot-panel .xtx-upd[data-state=available] .xtx-upd-ico{color:#22C55E;background:rgba(34,197,94,.12)}
+      #xtx-bot-panel .xtx-upd[data-state=latest] .xtx-upd-ico{color:#22C55E;background:rgba(34,197,94,.12)}
+      #xtx-bot-panel .xtx-upd[data-state=error] .xtx-upd-ico{color:#EF4444;background:rgba(239,68,68,.12)}
+      #xtx-bot-panel .xtx-upd[data-state=older] .xtx-upd-ico{color:#F59E0B;background:rgba(245,158,11,.12)}
+      #xtx-bot-panel .xtx-upd[data-state=checking] .xtx-upd-ico{color:#94A3B8;background:#1E293B}
+      /* 真的转起来（prefers-reduced-motion 下面会被全局 animation:none 关掉） */
+      #xtx-bot-panel .xtx-upd[data-state=checking] .xtx-upd-ico svg{animation:xtx-spin 1s linear infinite}
+      #xtx-bot-panel .xtx-upd-txt{flex:1;min-width:0;display:grid;gap:2px}
+      #xtx-bot-panel .xtx-upd-title{font-size:11.5px;font-weight:600;color:#F8FAFC;
+        overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+      #xtx-bot-panel .xtx-upd-sub{font-size:10.5px;line-height:1.45;color:#94A3B8;
+        display:-webkit-box;-webkit-box-orient:vertical;-webkit-line-clamp:2;overflow:hidden}
+      #xtx-bot-panel .xtx-upd-btn{flex:none;height:28px;padding:0 12px;border:0;border-radius:8px;
+        cursor:pointer;background:#22C55E;color:#05240f;font:600 11px/1 inherit;
+        transition:background .16s ease,box-shadow .16s ease,transform .12s ease}
+      #xtx-bot-panel .xtx-upd-btn:hover{box-shadow:0 0 0 3px rgba(34,197,94,.18)}
+      #xtx-bot-panel .xtx-upd-btn:active{transform:translateY(1px)}
+      #xtx-bot-panel .xtx-upd-btn:focus-visible{outline:2px solid #F8FAFC;outline-offset:2px}
+      #xtx-bot-panel .xtx-upd-btn[hidden]{display:none}
+      #xtx-bot-panel .xtx-upd-btn.ghost{background:transparent;color:#94A3B8;border:1px solid #334155}
+      #xtx-bot-panel .xtx-upd-btn.ghost:hover{color:#F8FAFC;border-color:#475569;box-shadow:none}
+      /* ---- 手动更新指引 ---- */
+      #xtx-bot-panel .xtx-guide{display:grid;gap:8px;padding:12px;border-bottom:1px solid #1E293B;
+        background:#0B1220}
+      #xtx-bot-panel .xtx-guide[hidden]{display:none}
+      #xtx-bot-panel.xtx-collapsed .xtx-guide{display:none}
+      #xtx-bot-panel .xtx-guide ol{margin:0;padding-left:16px;font-size:10.5px;line-height:1.7;color:#94A3B8}
+      #xtx-bot-panel .xtx-guide ol b{color:#F8FAFC;font-weight:600}
+      #xtx-bot-panel .xtx-guide code{font:10.5px/1.4 ui-monospace,"Cascadia Code",Consolas,monospace;
+        color:#22C55E;background:rgba(34,197,94,.1);border-radius:4px;padding:1px 4px}
+      #xtx-bot-panel .xtx-guide-act{display:flex;gap:8px}
       @keyframes xtx-blink{0%,100%{opacity:1;box-shadow:0 0 0 0 rgba(34,197,94,.55)}
         50%{opacity:.55;box-shadow:0 0 0 5px rgba(34,197,94,0)}}
       @keyframes xtx-glow{0%{box-shadow:0 0 0 0 rgba(239,68,68,.45)}
         70%{box-shadow:0 0 0 9px rgba(239,68,68,0)}100%{box-shadow:0 0 0 0 rgba(239,68,68,0)}}
       @keyframes xtx-pulse{0%,100%{transform:scale(1)}50%{transform:scale(.8)}}
+      @keyframes xtx-spin{to{transform:rotate(360deg)}}
       @media (prefers-reduced-motion:reduce){
         #xtx-bot-panel,#xtx-bot-panel *{animation:none!important;transition:none!important}}
     </style>
@@ -240,8 +319,30 @@ function ensurePanel() {
         <span class="xtx-led"></span>
         <span class="xtx-title">学堂在线自动刷课 / 做题</span>
       </span>
+      <span class="xtx-ver" id="xtx-ver" title="脚本版本">v—</span>
       <button class="xtx-icon" id="xtx-minimize" type="button" title="最小化" aria-label="最小化面板">${ICON_MIN}</button>
     </header>
+
+    <div class="xtx-upd" id="xtx-upd" data-state="idle" role="status" aria-live="polite" hidden>
+      <span class="xtx-upd-ico" id="xtx-upd-ico"></span>
+      <div class="xtx-upd-txt">
+        <div class="xtx-upd-title" id="xtx-upd-title"></div>
+        <div class="xtx-upd-sub" id="xtx-upd-sub"></div>
+      </div>
+      <button class="xtx-upd-btn" id="xtx-upd-btn" type="button" hidden></button>
+    </div>
+
+    <div class="xtx-guide" id="xtx-guide" hidden>
+      <ol>
+        <li>油猴只会接管 <code>.user.js</code> 结尾的链接。把 GitHub 上的文件改名为
+          <code>学堂在线刷课AI做题.user.js</code>（内容不用动），以后点「更新」就能一键装好。</li>
+        <li>或者：复制下面的新版本全文 → 打开油猴面板 → 编辑这个脚本 → 全选替换 → 保存。</li>
+      </ol>
+      <div class="xtx-guide-act">
+        <button class="xtx-upd-btn ghost" id="xtx-guide-copy" type="button">复制新版本全文</button>
+        <button class="xtx-upd-btn ghost" id="xtx-guide-repo" type="button">去 GitHub 改名</button>
+      </div>
+    </div>
 
     <div class="xtx-body">
       <div class="xtx-field">
@@ -285,6 +386,7 @@ function ensurePanel() {
       <div class="xtx-statusrow">
         <div class="xtx-status" id="xtx-status">未开始</div>
         <button class="xtx-link" id="xtx-selftest" type="button" title="发一条最小请求，检查接口地址和 Key 是否可用">检测接口</button>
+        <button class="xtx-link" id="xtx-updcheck" type="button" title="检查 GitHub 上有没有新版本">检查更新</button>
       </div>
       <div class="xtx-log" id="xtx-bot-log"></div>
     </div>`;
@@ -318,6 +420,26 @@ function ensurePanel() {
   panel.querySelector("#xtx-selftest").addEventListener("click", (e) => {
     e.stopPropagation();
     aiSelfTest();
+  });
+
+  // 手动检查更新（忽略缓存，强制去 GitHub 问一次）
+  panel.querySelector("#xtx-updcheck").addEventListener("click", (e) => {
+    e.stopPropagation();
+    checkForUpdate(true).catch(() => {});
+  });
+
+  // 手动更新指引：复制新版本全文 / 去 GitHub 改名
+  panel.querySelector("#xtx-guide-copy").addEventListener("click", (e) => {
+    e.stopPropagation();
+    copyToClipboard(updateFullText).then((ok) => {
+      log(ok ? "已复制新版本全文，去油猴面板里粘贴保存"
+              : "复制失败，请手动打开脚本地址复制全文");
+      if (ok) setStatus("新版本全文已复制");
+    });
+  });
+  panel.querySelector("#xtx-guide-repo").addEventListener("click", (e) => {
+    e.stopPropagation();
+    openInNewTab(UPDATE.repoUrl);
   });
 
   // 设置改动即保存（模型名等都会被记住）
@@ -439,6 +561,111 @@ function log(msg) {
   logBox.scrollTop = logBox.scrollHeight;
 }
 function setStatus(t) { if (statusEl) statusEl.textContent = t; }
+
+/* ---- 更新横幅的渲染（更新逻辑在第八节，这里只管显示） ---- */
+
+/** 设置横幅内容。btnLabel 为空则不显示按钮；onClick 为空则按钮只显示不可用。 */
+function setUpdateBanner(state, title, sub, btnLabel, onClick) {
+  if (!panel) return;
+  const box = panel.querySelector("#xtx-upd");
+  if (!box) return;
+  const ico = panel.querySelector("#xtx-upd-ico");
+  const ttl = panel.querySelector("#xtx-upd-title");
+  const sb = panel.querySelector("#xtx-upd-sub");
+  const btn = panel.querySelector("#xtx-upd-btn");
+  box.dataset.state = state;
+  if (ico) {
+    ico.innerHTML = state === "checking" ? ICON_UPD_SPIN
+      : state === "available" ? ICON_UPD_DOWNLOAD
+      : state === "error" ? ICON_UPD_ERROR
+      : state === "older" ? ICON_UPD_INFO : ICON_UPD_OK;
+  }
+  if (ttl) ttl.textContent = title || "";
+  if (sb) sb.textContent = sub || "";
+  if (btn) {
+    if (btnLabel) {
+      btn.hidden = false;
+      btn.textContent = btnLabel;
+      btn.classList.toggle("ghost", state !== "available");
+      btn.disabled = !onClick;
+      btn.onclick = onClick ? (e) => { e.stopPropagation(); onClick(e); } : null;
+    } else {
+      btn.hidden = true;
+      btn.onclick = null;
+    }
+  }
+  box.hidden = false;
+}
+
+/** 隐藏横幅 */
+function hideUpdateBanner() {
+  if (!panel) return;
+  const box = panel.querySelector("#xtx-upd");
+  if (box) box.hidden = true;
+  const guide = panel.querySelector("#xtx-guide");
+  if (guide) guide.hidden = true;
+}
+
+/** 把一次检查结果画到面板上。
+ *  manual=true 是用户手动点的 → 显示"正在检查…"；自动检查时不显示，避免闪一下。 */
+function renderUpdate(res, manual) {
+  const r = res || { state: "idle" };
+  // checking 状态不要把上一次的 url 弄丢：否则用户在检查过程中点「更新」会没反应
+  updateInfo = (r.state === "checking" && updateInfo && updateInfo.url)
+    ? Object.assign({}, updateInfo, { state: "checking", local: r.local })
+    : r;
+  if (!panel) return;
+  const ver = panel.querySelector("#xtx-ver");
+  if (ver) {
+    // 有新版时徽章除了变色，还加一个 "↑"（颜色不能是唯一区分手段）
+    ver.textContent = "v" + (r.local ? r.local : "—") + (r.state === "available" ? " ↑" : "");
+    ver.classList.toggle("has-update", r.state === "available");
+    ver.title = r.state === "available"
+      ? `有新版 v${r.remote}（当前 v${r.local}），点面板里的「更新」`
+      : (r.remote ? `本地 v${r.local} / 远程 v${r.remote}` : "脚本版本");
+  }
+  const guide = panel.querySelector("#xtx-guide");
+  // 每次重画都先把手动指引收起来：它只在 performUpdate() 里按需重新打开，
+  // 否则状态一变（比如用户把文件改名了），旧的"需要手动更新"文案会残留
+  if (guide) guide.hidden = true;
+
+  const st = r.state;
+  if (st === "checking") {
+    if (manual) setUpdateBanner("checking", "正在检查更新…", UPDATE.url, "", null);
+    return;
+  }
+  if (st === "available") {
+    setUpdateBanner("available", `发现新版本 v${r.remote}`,
+      `当前 v${r.local} · 点「更新」交给油猴安装`, "更新", () => { performUpdate(); });
+    if (manual) log(`发现新版本 v${r.remote}（当前 v${r.local}）`);
+    return;
+  }
+  if (st === "older") {
+    setUpdateBanner("older", `远程 v${r.remote} 比本地旧`,
+      `本地 v${r.local}，已忽略`, "", null);
+    return;
+  }
+  if (st === "latest") {
+    // 手动检查必须有反馈：否则用户点了「检查更新」什么也看不到，以为没反应
+    if (manual) {
+      setUpdateBanner("latest", "已经是最新版本", `本地 v${r.local}`, "", null);
+      log(`已经是最新版本（v${r.local}）`);
+      clearTimeout(latestBannerTimer);
+      latestBannerTimer = setTimeout(() => {
+        if (updateInfo && updateInfo.state === "latest") hideUpdateBanner();
+      }, 5000);
+    } else {
+      hideUpdateBanner();
+    }
+    return;
+  }
+  if (st === "error") {
+    setUpdateBanner("error", "检查更新失败",
+      r.reason || "网络不通", "重试", () => { checkForUpdate(true).catch(() => {}); });
+    return;
+  }
+  hideUpdateBanner();
+}
 
 /* =========================================================================
  * 四、网络记录器
@@ -1874,7 +2101,292 @@ async function waitCaptchaDone() {
 }
 
 /* =========================================================================
- * 八、主流程
+ * 八、GitHub 自动更新
+ * ========================================================================= */
+const UPDATE_CACHE_KEY = "xtx_update_cache_v1";
+/* 探测顺序：优先主地址（.user.js，油猴能接管 → 点更新就是油猴自己的更新页），
+   其次兜底地址（旧 .txt 文件名，改名完成前仍然能查到版本） */
+const UPDATE_URLS = [UPDATE.url, UPDATE.fallbackUrl];
+
+const ICON_UPD_DOWNLOAD =
+  '<svg viewBox="0 0 24 24" width="14" height="14" aria-hidden="true" fill="none" stroke="currentColor" ' +
+  'stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">' +
+  '<path d="M3 16.5v2.25A2.25 2.25 0 0 0 5.25 21h13.5A2.25 2.25 0 0 0 21 18.75V16.5"/>' +
+  '<path d="M16.5 12 12 16.5m0 0L7.5 12m4.5 4.5V3"/></svg>';
+const ICON_UPD_ERROR =
+  '<svg viewBox="0 0 24 24" width="14" height="14" aria-hidden="true" fill="none" stroke="currentColor" ' +
+  'stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">' +
+  '<path d="M12 9v4"/><path d="M12 17h.01"/>' +
+  '<path d="M10.3 3.6 1.9 18.2A2 2 0 0 0 3.6 21h16.8a2 2 0 0 0 1.7-2.8L13.7 3.6a2 2 0 0 0-3.4 0Z"/></svg>';
+const ICON_UPD_INFO =
+  '<svg viewBox="0 0 24 24" width="14" height="14" aria-hidden="true" fill="none" stroke="currentColor" ' +
+  'stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">' +
+  '<circle cx="12" cy="12" r="9"/><path d="M12 11v5"/><path d="M12 8h.01"/></svg>';
+const ICON_UPD_OK =
+  '<svg viewBox="0 0 24 24" width="14" height="14" aria-hidden="true" fill="none" stroke="currentColor" ' +
+  'stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">' +
+  '<circle cx="12" cy="12" r="9"/><path d="m8.5 12.2 2.4 2.4 4.6-4.9"/></svg>';
+const ICON_UPD_SPIN =
+  '<svg viewBox="0 0 24 24" width="14" height="14" aria-hidden="true" fill="none" stroke="currentColor" ' +
+  'stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">' +
+  '<path d="M20.5 12a8.5 8.5 0 1 1-2.49-6.01"/><path d="M20.5 4.5v5h-5"/></svg>';
+
+/** 本地已安装的脚本版本（油猴的 GM_info） */
+function localVersion() {
+  try {
+    if (typeof GM_info !== "undefined" && GM_info && GM_info.script) {
+      return String(GM_info.script.version || "").trim() || null;
+    }
+  } catch (e) { /* ignore */ }
+  return null;
+}
+
+/** 比较版本号：a>b → 1，a<b → -1，一样 → 0
+ *  按点分段数字比（1.10 > 1.9）；带 -beta 之类的预发布标记算比正式版旧。
+ *  预发布段按 semver 规则比（rc.10 > rc.9；非数字段按 ASCII 字典序，数字段比非数字段旧）。
+ *  预发布比较刻意内联在这里：整个函数自包含，不依赖外部 helper。 */
+function compareVersions(a, b) {
+  const norm = (v) => String(v == null ? "" : v).trim().replace(/^v/i, "");
+  const pa = norm(a).split("-"), pb = norm(b).split("-");
+  const na = pa[0].split(".").map((x) => parseInt(x, 10) || 0);
+  const nb = pb[0].split(".").map((x) => parseInt(x, 10) || 0);
+  const len = Math.max(na.length, nb.length);
+  for (let i = 0; i < len; i++) {
+    const x = na[i] || 0, y = nb[i] || 0;
+    if (x !== y) return x > y ? 1 : -1;
+  }
+  const preA = pa.length > 1, preB = pb.length > 1;
+  if (preA !== preB) return preA ? -1 : 1;      // 预发布版比正式版旧
+  if (preA && preB) {
+    const qa = pa[1].split("."), qb = pb[1].split(".");
+    const n = Math.max(qa.length, qb.length);
+    for (let i = 0; i < n; i++) {
+      const x = qa[i], y = qb[i];
+      if (x === undefined) return -1;
+      if (y === undefined) return 1;
+      const ix = /^\d+$/.test(x), iy = /^\d+$/.test(y);
+      if (ix && iy) {
+        const d = (parseInt(x, 10) || 0) - (parseInt(y, 10) || 0);
+        if (d) return d > 0 ? 1 : -1;
+        continue;
+      }
+      if (ix) return -1;                        // 数字段比非数字段旧
+      if (iy) return 1;
+      if (x !== y) return x > y ? 1 : -1;
+    }
+    return 0;
+  }
+  return 0;
+}
+
+/** 从脚本文本里解析 @version。
+ *  只认元数据块（==UserScript== ... ==/UserScript==）里的 @version：
+ *  正文里随便写一行 "// @version x" 不算数（否则版本判定会被正文劫持）。 */
+function parseScriptVersion(text) {
+  const s = String(text || "");
+  const i = s.indexOf("==UserScript==");
+  const j = s.indexOf("==/UserScript==");
+  // 找得到元数据块就只在块里找；只有开始标记（文件被截断）就从标记往后取 2KB；
+  // 连开始标记都没有（不是油猴脚本）就退回头部 2KB
+  const scope = (i >= 0)
+    ? s.slice(i, (j > i ? j : Math.min(s.length, i + 2000)))
+    : s.slice(0, 2000);
+  const m = scope.match(/^[ \t]*\/\/[ \t]*@version[ \t]+(\S+)/m);
+  return m ? m[1] : null;
+}
+
+/** GET 一个文本地址。带 Range 头时只取头部几 KB，省流量。 */
+function gmFetchText(url, headers) {
+  return new Promise((resolve, reject) => {
+    const fn = (typeof GM_xmlhttpRequest !== "undefined" && GM_xmlhttpRequest) ||
+               (typeof GM !== "undefined" && GM && GM.xmlHttpRequest);
+    if (!fn) { reject(new Error("GM_xmlhttpRequest 不可用")); return; }
+    fn({
+      method: "GET", url: url, headers: headers || {}, timeout: 20000,
+      onload: (r) => resolve({ status: r.status, text: String(r.responseText || "") }),
+      onerror: (e) => reject(new Error("网络错误: " + (e && e.error))),
+      ontimeout: () => reject(new Error("请求超时")),
+    });
+  });
+}
+
+/** 打开一个新标签页（优先用油猴的 API，失败退回 window.open） */
+function openInNewTab(url) {
+  try {
+    if (typeof GM_openInTab === "function") {
+      GM_openInTab(url, { active: true, insert: true, setParent: true });
+      return true;
+    }
+  } catch (e) { /* ignore */ }
+  try { window.open(url, "_blank", "noopener"); return true; } catch (e) { /* ignore */ }
+  return false;
+}
+
+/** 复制文本到剪贴板（优先用 Clipboard API，失败退回 execCommand） */
+async function copyToClipboard(text) {
+  const t = String(text || "");
+  if (!t) return false;
+  try {
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+      await navigator.clipboard.writeText(t);
+      return true;
+    }
+  } catch (e) { /* 落到下面的兜底 */ }
+  try {
+    const ta = document.createElement("textarea");
+    ta.value = t;
+    ta.setAttribute("readonly", "");
+    ta.style.position = "fixed";
+    ta.style.left = "-9999px";
+    ta.style.opacity = "0";
+    document.body.appendChild(ta);
+    ta.select();
+    ta.setSelectionRange(0, t.length);
+    const ok = document.execCommand("copy");
+    document.body.removeChild(ta);
+    return !!ok;
+  } catch (e) { return false; }
+}
+
+/** 当前更新状态（供面板渲染用） */
+let updateInfo = { state: "idle", local: null, remote: null, url: null, at: 0 };
+/** 手动更新指引里待复制的完整脚本 */
+let updateFullText = "";
+/** 正在飞行的更新检查（防止连点「检查更新」重复打 GitHub） */
+let updateChecking = null;
+/** 手动触发标记：请求在飞的时候用户又点了「检查更新」，这一轮也要按手动处理 */
+let updateForcePending = false;
+/** 「已经是最新版本」横幅的自动收起定时器 */
+let latestBannerTimer = null;
+
+/** 检查远程版本。
+ *  force=true 时忽略缓存（面板上点「检查更新」用）。
+ *  返回 { state, local, remote, url, reason, at } */
+async function checkForUpdate(force) {
+  if (force) updateForcePending = true;
+  // 已经在查了：直接等它，不要重复打 GitHub
+  if (updateChecking) return updateChecking;
+  updateChecking = runUpdateCheck();
+  try {
+    return await updateChecking;
+  } finally {
+    updateChecking = null;
+    updateForcePending = false;
+  }
+}
+
+/** 真正去问远程版本的那一段 */
+async function runUpdateCheck() {
+  const local = localVersion();
+  if (!local) {
+    const r = { state: "idle", local: null, remote: null, url: null, at: Date.now() };
+    gmSet(UPDATE_CACHE_KEY, r);
+    renderUpdate(r, updateForcePending);
+    return r;
+  }
+
+  const cached = gmGet(UPDATE_CACHE_KEY, null);
+  const cacheFresh = cached && cached.state !== "checking" &&
+    Date.now() - (cached.at || 0) < UPDATE.checkIntervalMs;
+  // 本地版本变了 → 说明脚本刚被更新过，缓存里的结论作废，得重新问一次
+  const localChanged = !!(cached && cached.local && cached.local !== local);
+
+  if (!updateForcePending && cacheFresh && !localChanged) {
+    // 缓存还在有效期内：不用重新拉远程，但要用【当前本地版本】重新判定状态
+    const r = Object.assign({}, cached, { local: local });
+    if (cached.state === "error") {
+      r.state = "error";
+    } else if (cached.remote) {
+      const c = compareVersions(cached.remote, local);
+      r.state = c > 0 ? "available" : (c < 0 ? "older" : "latest");
+    }
+    renderUpdate(r, false);
+    return r;
+  }
+
+  renderUpdate({ state: "checking", local: local }, updateForcePending);
+
+  // 重新去问远程 → 之前缓存的"新版本全文"可能已经过期，作废
+  updateFullText = "";
+
+  let remote = null, url = null, reason = "";
+  for (const u of UPDATE_URLS) {
+    try {
+      const r = await gmFetchText(u, { "Range": "bytes=0-3071" });
+      if (r.status === 200 || r.status === 206) {
+        const v = parseScriptVersion(r.text);
+        if (v) { remote = v; url = u; break; }
+        reason = "远程文件里没有 @version";
+      } else if (r.status === 404) {
+        reason = "远程地址不存在（404）";
+      } else {
+        reason = "远程返回 " + r.status;
+      }
+    } catch (e) {
+      reason = (e && e.message) ? e.message : String(e);
+    }
+  }
+
+  const res = { state: "idle", local: local, remote: remote, url: url, reason: reason, at: Date.now() };
+  if (!remote) {
+    res.state = "error";
+  } else {
+    const c = compareVersions(remote, local);
+    res.state = c > 0 ? "available" : (c < 0 ? "older" : "latest");
+  }
+  gmSet(UPDATE_CACHE_KEY, res);
+  renderUpdate(res, updateForcePending);
+  // 手动检查且远程仍比本地新、但仓库文件仍不是 .user.js 结尾 → 继续给手动指引
+  // （自动检查不弹，避免每次打开页面都糊一块指引）
+  if (updateForcePending && res.state === "available" && res.url && !/\.user\.js(\?|#|$)/i.test(res.url)) {
+    await showManualUpdateGuide(res.url, res.remote);
+  }
+  return res;
+}
+
+/** 点「更新」：油猴能接管的（.user.js）交给油猴，否则给手动指引 */
+let updateBusy = false;
+async function performUpdate() {
+  if (updateBusy) return;
+  const info = updateInfo;
+  if (!info || !info.url) return;
+  updateBusy = true;
+  try {
+    if (/\.user\.js(\?|#|$)/i.test(info.url)) {
+      const ok = openInNewTab(info.url);
+      if (ok) {
+        setUpdateBanner("available", "已打开油猴的更新页",
+          "在油猴的页面点「更新」，然后刷新本页即可生效", "", null);
+        log("已打开油猴的更新页：" + info.url);
+        return;
+      }
+    }
+    await showManualUpdateGuide(info.url, info.remote);
+  } finally {
+    updateBusy = false;
+  }
+}
+
+/** 降级路径：仓库文件不是 .user.js 结尾，油猴接管不了 → 给出手动步骤 */
+async function showManualUpdateGuide(url, remote) {
+  if (!updateFullText) {
+    try {
+      const r = await gmFetchText(url, null);
+      if (r.status === 200) updateFullText = r.text || "";
+    } catch (e) { /* 拿不到就只给步骤 */ }
+  }
+  const guide = panel && panel.querySelector("#xtx-guide");
+  if (guide) guide.hidden = false;
+  // 横幅主按钮改成「重新检查」：用户按指引把文件改名后，点它就能重新判定
+  setUpdateBanner("available", "需要手动更新一下" + (remote ? "（远程 v" + remote + "）" : ""),
+    "仓库文件还没改成 .user.js 结尾，油猴接管不了这个链接", "重新检查", () => {
+      checkForUpdate(true).catch(() => {});
+    });
+  log("油猴无法接管这个地址（不是 .user.js 结尾），已给出手动更新步骤");
+}
+
+/* =========================================================================
+ * 九、主流程
  * ========================================================================= */
 const state = { stopped: false, running: false, token: 0, doneVideos: 0, doneExams: 0 };
 
@@ -2060,6 +2572,9 @@ function start() {
     if (abortPrefMigrated) {
       log("已把『AI 出错时』改成『跳过该题继续』：AI 答不出答案时只跳过这一题，不影响后面的题。");
     }
+
+    // 每次打开页面都顺手查一次 GitHub 上有没有新版本（5 分钟内不重复问）
+    checkForUpdate(false).catch(() => { /* 更新检查失败不影响主功能 */ });
 
     const run = gmGet(RUN_KEY, null);
     if (run && Date.now() - (run.ts || 0) < 30 * 60 * 1000) {
