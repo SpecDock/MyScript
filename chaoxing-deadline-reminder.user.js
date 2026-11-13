@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         超星通用课程截止提醒
 // @namespace    chaoxing-deadline
-// @version      2.8.3
-// @description  通用课程（含新版）和课程都读取：列出还没截止的作业和考试（含未设置截止时间的），单列最近30天已结束且未作答的作业，另列出未结课且章节没看完的课程
+// @version      2.9.0
+// @description  通用课程（含新版）和课程都读取：列出还没截止的作业和考试（含未设置截止时间的），单列最近30天已结束且未作答的作业，另列出未结课且章节没看完的课程；菜单一键更新
 // @match        https://mooc1-2.chaoxing.com/visit/courses*
 // @match        https://mooc1-2.chaoxing.com/mooc-ans/visit/courses*
 // @match        https://mooc1.chaoxing.com/visit/courses*
@@ -26,8 +26,15 @@
 // @connect      mobilelearn.chaoxing.com
 // @connect      fycourse.fanya.chaoxing.com
 // @connect      fyportal.chaoxing.com
+// @connect      raw.githubusercontent.com
+// @connect      cdn.jsdelivr.net
 // @grant        GM_xmlhttpRequest
 // @grant        GM_addStyle
+// @grant        GM_registerMenuCommand
+// @grant        GM_openInTab
+// @grant        GM_info
+// @updateURL    https://raw.githubusercontent.com/SpecDock/MyScript/master/chaoxing-deadline-reminder.user.js
+// @downloadURL  https://raw.githubusercontent.com/SpecDock/MyScript/master/chaoxing-deadline-reminder.user.js
 // @run-at       document-idle
 // ==/UserScript==
 
@@ -247,7 +254,24 @@
   const minBtn = panel.querySelector('[data-act="min"]');
   const logBtn = panel.querySelector('[data-act="log"]');
   const scanBtn = panel.querySelector('[data-act="scan"]');
-  const VERSION = '2.8.3';
+  const FALLBACK_VERSION = '2.9.0';
+  const VERSION = (function () {
+    try {
+      if (typeof GM_info !== 'undefined' && GM_info && GM_info.script && GM_info.script.version) {
+        const v = String(GM_info.script.version).trim();
+        if (v) return v;
+      }
+    } catch (e) { /* ignore */ }
+    return FALLBACK_VERSION;
+  })();
+  // 更新检查：与仓库里的翻译脚本一致，只走菜单「更新」
+  const UPDATE = {
+    repo: 'SpecDock/MyScript',
+    file: 'chaoxing-deadline-reminder.user.js',
+    branches: ['master', 'main'],
+    timeout: 6000,
+    deadline: 10000
+  };
   let logLines = [];
 
   function log(msg) {
@@ -2028,6 +2052,244 @@
     confirmSettledRows(nextSettled, gen);
   }
 
+  /* =====================================================================
+   * 更新检查（菜单「更新」）
+   * 与仓库里的翻译脚本一致：只走油猴菜单，不在页面上放更新按钮。
+   * ===================================================================== */
+
+  const UPDATE_TOAST_CSS = `
+    :host { all: initial; }
+    .toast {
+      box-sizing: border-box;
+      max-width: min(360px, calc(100vw - 32px));
+      padding: 9px 14px;
+      border-radius: 10px;
+      background: rgba(23, 25, 29, .94);
+      color: #f3f4f6;
+      border: 1px solid rgba(255, 255, 255, .08);
+      box-shadow: 0 12px 32px rgba(0, 0, 0, .3);
+      font-family: system-ui, -apple-system, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
+      font-size: 13px;
+      line-height: 1.5;
+      text-align: center;
+      animation: cx-toast-in .14s ease-out;
+    }
+    @media (prefers-reduced-motion: reduce) { .toast { animation: none; } }
+    @keyframes cx-toast-in {
+      from { opacity: 0; transform: translateY(4px); }
+      to { opacity: 1; transform: none; }
+    }
+  `;
+
+  let updateToastHost = null;
+  let updateToastShadow = null;
+  let updateToastText = null;
+
+  function ensureUpdateToast() {
+    if (updateToastHost || !document.documentElement) return;
+    updateToastHost = document.createElement('div');
+    updateToastHost.setAttribute('data-cx-update-toast', '1');
+    updateToastHost.style.cssText = 'all:initial;position:fixed;left:50%;bottom:24px;transform:translateX(-50%);z-index:2147483647;display:none;pointer-events:none;';
+    updateToastShadow = updateToastHost.attachShadow({ mode: 'open' });
+    const style = document.createElement('style');
+    style.textContent = UPDATE_TOAST_CSS;
+    updateToastShadow.appendChild(style);
+    const toast = document.createElement('div');
+    toast.className = 'toast';
+    toast.setAttribute('role', 'status');
+    toast.setAttribute('aria-live', 'polite');
+    updateToastText = toast;
+    updateToastShadow.appendChild(toast);
+    document.documentElement.appendChild(updateToastHost);
+  }
+
+  function showUpdateToast(message) {
+    ensureUpdateToast();
+    if (!updateToastHost) return;
+    updateToastText.textContent = message;
+    updateToastHost.style.display = 'block';
+  }
+
+  function hideUpdateToast() {
+    if (updateToastHost) updateToastHost.style.display = 'none';
+  }
+
+  function cmpVersion(a, b) {
+    const parse = function (v) {
+      return String(v == null ? '' : v)
+        .trim()
+        .replace(/^v/i, '')
+        .split('-')[0]
+        .split('.')
+        .map(function (x) {
+          const n = parseInt(x, 10);
+          return Number.isFinite(n) ? n : 0;
+        });
+    };
+    const pa = parse(a);
+    const pb = parse(b);
+    const len = Math.max(pa.length, pb.length);
+    for (let i = 0; i < len; i++) {
+      const x = pa[i] || 0;
+      const y = pb[i] || 0;
+      if (x !== y) return x > y ? 1 : -1;
+    }
+    return 0;
+  }
+
+  function parseRemoteVersion(text) {
+    const src = String(text || '');
+    const start = src.indexOf('==UserScript==');
+    const end = src.indexOf('==/UserScript==');
+    const scope = start >= 0
+      ? src.slice(start, end > start ? end : Math.min(src.length, start + 4000))
+      : src.slice(0, 4000);
+    const m = scope.match(/^[ \t]*\/\/[ \t]*@version[ \t]+(\S+)/m);
+    return m ? m[1] : '';
+  }
+
+  function rawScriptUrl(branch) {
+    return 'https://raw.githubusercontent.com/' + UPDATE.repo + '/' + encodeURIComponent(branch)
+      + '/' + UPDATE.file.split('/').map(encodeURIComponent).join('/');
+  }
+
+  function cdnScriptUrl(branch) {
+    return 'https://cdn.jsdelivr.net/gh/' + UPDATE.repo + '@' + branch
+      + '/' + UPDATE.file.split('/').map(encodeURIComponent).join('/');
+  }
+
+  function probeRemote(url, bust) {
+    return new Promise(function (resolve) {
+      let settled = false;
+      let timer = 0;
+      function done(result) {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        resolve(result);
+      }
+      timer = setTimeout(function () { done({ version: '', network: true }); }, UPDATE.timeout);
+      try {
+        GM_xmlhttpRequest({
+          method: 'GET',
+          url: url + (bust ? (url.indexOf('?') === -1 ? '?' : '&') + '_=' + Date.now() : ''),
+          timeout: UPDATE.timeout,
+          anonymous: true,
+          headers: { 'Accept': 'text/plain, */*' },
+          onload: function (res) {
+            if (res.status !== 200) { done({ version: '', network: false }); return; }
+            done({ version: parseRemoteVersion(res.responseText || ''), network: false });
+          },
+          onerror: function () { done({ version: '', network: true }); },
+          ontimeout: function () { done({ version: '', network: true }); },
+          onabort: function () { done({ version: '', network: true }); }
+        });
+      } catch (e) {
+        done({ version: '', network: true });
+      }
+    });
+  }
+
+  function withDeadline(promise, ms) {
+    let timer = 0;
+    const deadline = new Promise(function (resolve, reject) {
+      timer = setTimeout(function () {
+        const err = new Error('deadline');
+        err.network = true;
+        reject(err);
+      }, ms);
+    });
+    return Promise.race([promise, deadline]).finally(function () { clearTimeout(timer); });
+  }
+
+  async function fetchLatestVersion() {
+    const primaryBranch = UPDATE.branches[0];
+    const primaryUrl = rawScriptUrl(primaryBranch);
+    const primary = await probeRemote(primaryUrl, true);
+    if (primary.version) return { version: primary.version, url: primaryUrl };
+
+    const candidates = [];
+    UPDATE.branches.forEach(function (branch) {
+      ['raw', 'cdn'].forEach(function (source) {
+        if (branch === primaryBranch && source === 'raw') return;
+        candidates.push({
+          url: source === 'raw' ? rawScriptUrl(branch) : cdnScriptUrl(branch)
+        });
+      });
+    });
+    const results = await Promise.all(candidates.map(async function (c) {
+      const probe = await probeRemote(c.url, false);
+      return { url: c.url, version: probe.version, network: probe.network };
+    }));
+    const hit = results.find(function (r) { return r.version; });
+    if (hit) return { version: hit.version, url: hit.url };
+
+    const reachable = !primary.network || results.some(function (r) { return !r.network; });
+    if (!reachable) {
+      const err = new Error('github unreachable');
+      err.network = true;
+      throw err;
+    }
+    throw new Error('remote version not found');
+  }
+
+  let updateChecking = false;
+
+  function openScriptPage(url) {
+    try {
+      if (typeof GM_openInTab === 'function') {
+        GM_openInTab(url, { active: true, insert: true });
+        return;
+      }
+    } catch (e) { /* ignore */ }
+    window.open(url, '_blank', 'noopener');
+  }
+
+  // 子框架里 Chrome 可能拦截 alert（菜单点击不算框架内的用户手势），改用提示条保证有反馈
+  function notifyUpdate(message) {
+    let isTop = false;
+    try { isTop = window.top === window; } catch (e) { isTop = false; }
+    if (isTop) {
+      alert(message);
+      return;
+    }
+    showUpdateToast(message);
+    setTimeout(hideUpdateToast, 4000);
+  }
+
+  async function checkForUpdate() {
+    if (updateChecking) {
+      showUpdateToast('正在检查更新…');
+      return;
+    }
+    updateChecking = true;
+    showUpdateToast('正在检查更新…');
+    try {
+      const latest = await withDeadline(fetchLatestVersion(), UPDATE.deadline);
+      hideUpdateToast();
+      if (!latest || !latest.version || cmpVersion(latest.version, VERSION) <= 0) {
+        notifyUpdate('已是最新版本 v' + VERSION);
+        return;
+      }
+      openScriptPage(latest.url);
+    } catch (e) {
+      hideUpdateToast();
+      notifyUpdate(e && e.network
+        ? '检查失败：网络异常或访问 GitHub 超时，请检查网络后重试。'
+        : '检查失败：未能获取版本信息，请稍后重试。');
+    } finally {
+      updateChecking = false;
+    }
+  }
+
+  function registerUpdateMenu() {
+    try {
+      if (typeof GM_registerMenuCommand === 'function') {
+        GM_registerMenuCommand('更新', function () { checkForUpdate().catch(function () {}); });
+      }
+    } catch (e) { /* ignore */ }
+  }
+
   setInterval(function () {
     if (!loading && (rows.length || endedRows.length || chapterRows.length)) render();
   }, 30000);
@@ -2035,6 +2297,7 @@
   // v2.5.0：不再自动扫描。
   // 以前是「页面一加载 + DOM 一变化 + 切学期筛选」就自动跑，刷新一次就白扫一遍，
   // 还会在用户没要求的时候先打出去几十个请求。现在改成纯手动：点「▶ 扫描」才发请求。
+  registerUpdateMenu();
   log('脚本 v' + VERSION + ' 已就绪（' + location.host + '），点「▶ 扫描」开始读取；不会自动读取');
   renderIdle();
 })();
