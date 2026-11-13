@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Selection Translator
 // @namespace    specdock.my-script.selection-translator
-// @version      1.4.0
-// @description  静默划词翻译：中文→英文，其他→中文。Google / 微软 / 腾讯 → 火山 / 有道 / 彩云 → MyMemory 分批并发回退，LLM 兜底；可视化设置面板；GitHub 版本检测与一键更新。
+// @version      1.4.1
+// @description  静默划词翻译：中文→英文，其他→中文。Google / 微软 / 腾讯 → 火山 / 有道 / 彩云 → MyMemory 分批并发回退，LLM 兜底；可视化设置面板；菜单一键更新。
 // @author       SpecDock
 // @match        *://*/*
 // @run-at       document-idle
@@ -35,7 +35,7 @@
 
   const SCRIPT_NAME = 'Selection Translator';
   const SCRIPT_NS = 'specdock.my-script.selection-translator';
-  const FALLBACK_VERSION = '1.4.0';
+  const FALLBACK_VERSION = '1.4.1';
   const SCRIPT_VERSION = (() => {
     try {
       return (typeof GM_info !== 'undefined' && GM_info.script && GM_info.script.version) || FALLBACK_VERSION;
@@ -80,8 +80,6 @@
     repo: 'SpecDock/MyScript',
     file: 'selection-translator.user.js',
     branches: ['master', 'main'],
-    // 检查结果缓存时长：避免每个页面都请求 GitHub；设为 0 表示每次打开都实时检查
-    ttl: 60 * 1000,
     timeout: 8000,
   };
 
@@ -91,8 +89,6 @@
     llmModel: 'st.llm.model',
     msToken: 'st.ms.token',
     enginesDown: 'st.engines.down',
-    updateState: 'st.update.state',
-    updateHide: 'st.update.hide',
   };
 
   const cfg = {
@@ -882,89 +878,7 @@
     });
   }
 
-  /* ================= 7. 更新检查与更新提示 ================= */
-
-  const UPDATE_CSS = `
-    :host { all: initial; }
-    .pill {
-      box-sizing: border-box;
-      display: flex;
-      align-items: center;
-      gap: 8px;
-      max-width: min(460px, calc(100vw - 32px));
-      padding: 8px 8px 8px 12px;
-      border-radius: 999px;
-      background: #ffffff;
-      color: #111827;
-      border: 1px solid rgba(15, 23, 42, .1);
-      box-shadow: 0 12px 32px rgba(15, 23, 42, .16), 0 2px 6px rgba(15, 23, 42, .06);
-      font-family: system-ui, -apple-system, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
-      font-size: 12.5px;
-      line-height: 1.45;
-      animation: st-upd-in .18s ease-out;
-    }
-    .icon { display: inline-flex; flex: none; color: #2563eb; }
-    .msg { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-    .btn {
-      flex: none;
-      border: 0;
-      border-radius: 999px;
-      padding: 5px 12px;
-      background: #2563eb;
-      color: #ffffff;
-      font: inherit;
-      font-weight: 600;
-      line-height: 1.2;
-      cursor: pointer;
-      transition: background-color .15s ease-out;
-    }
-    .btn:hover { background: #1d4ed8; }
-    .btn:active { background: #1e40af; }
-    .close {
-      flex: none;
-      display: inline-flex;
-      align-items: center;
-      justify-content: center;
-      width: 24px;
-      height: 24px;
-      padding: 0;
-      border: 0;
-      border-radius: 50%;
-      background: transparent;
-      color: #6b7280;
-      cursor: pointer;
-      transition: background-color .15s ease-out, color .15s ease-out;
-    }
-    .close:hover { background: rgba(15, 23, 42, .06); color: #111827; }
-    .btn:focus-visible, .close:focus-visible { outline: 2px solid #2563eb; outline-offset: 2px; }
-    @media (prefers-color-scheme: dark) {
-      .pill {
-        background: #26282c;
-        color: #e8eaed;
-        border-color: rgba(255, 255, 255, .1);
-        box-shadow: 0 12px 32px rgba(0, 0, 0, .5);
-      }
-      .btn:focus-visible, .close:focus-visible { outline-color: #60a5fa; }
-      .icon { color: #60a5fa; }
-      .close { color: #9ca3af; }
-      .close:hover { background: rgba(255, 255, 255, .08); color: #f3f4f6; }
-    }
-    @media (prefers-reduced-motion: reduce) {
-      .pill { animation: none; }
-      .btn, .close { transition: none; }
-    }
-    @keyframes st-upd-in {
-      from { opacity: 0; transform: translateY(6px); }
-      to { opacity: 1; transform: none; }
-    }
-  `;
-
-  let updHost = null;
-  let updShadow = null;
-  let updMsg = null;
-  let updateTarget = null;
-  let updateShownVersion = '';
-  let updateCheckPromise = null;
+  /* ================= 7. 更新检查 ================= */
 
   function makeSvg(d, size) {
     const NS = 'http://www.w3.org/2000/svg';
@@ -992,77 +906,6 @@
       }
     } catch (e) {}
     window.open(url, '_blank', 'noopener');
-  }
-
-  function ensureUpdateUi() {
-    if (updHost || !document.documentElement) return;
-    updHost = document.createElement('div');
-    updHost.setAttribute('data-st-ui', 'update');
-    updHost.style.cssText = 'all:initial;position:fixed;right:16px;bottom:16px;z-index:2147483646;display:none;';
-    updShadow = updHost.attachShadow({ mode: 'open' });
-    adopt(updShadow, UPDATE_CSS);
-
-    const pill = make('div', 'pill');
-    pill.setAttribute('role', 'status');
-    pill.setAttribute('aria-live', 'polite');
-
-    const icon = make('span', 'icon');
-    icon.appendChild(makeSvg('M13.5 2.6v2.6h-2.6M13.5 8a5.5 5.5 0 1 1-1.61-3.89', 14));
-    updMsg = make('span', 'msg');
-
-    const btn = make('button', 'btn', '更新');
-    btn.type = 'button';
-    const close = make('button', 'close');
-    close.type = 'button';
-    close.setAttribute('aria-label', '关闭更新提示');
-    close.title = '关闭';
-    close.appendChild(makeSvg('M4.5 4.5l7 7M11.5 4.5l-7 7', 12));
-
-    pill.appendChild(icon);
-    pill.appendChild(updMsg);
-    pill.appendChild(btn);
-    pill.appendChild(close);
-    updShadow.appendChild(pill);
-
-    btn.addEventListener('click', () => {
-      if (!updateTarget) return;
-      const target = updateTarget;
-      hideUpdatePill();
-      openUrl(target.url);
-    });
-    close.addEventListener('click', () => {
-      if (updateShownVersion) {
-        try { sessionStorage.setItem(K.updateHide, updateShownVersion); } catch (e) {}
-      }
-      hideUpdatePill();
-    });
-
-    ['mousedown', 'mouseup', 'click', 'dblclick'].forEach(type => {
-      updHost.addEventListener(type, e => e.stopPropagation());
-    });
-    document.documentElement.appendChild(updHost);
-  }
-
-  function hideUpdatePill() {
-    if (updHost) updHost.style.display = 'none';
-  }
-
-  function showUpdatePill(latest) {
-    if (!latest || !latest.version) return;
-    let hidden = '';
-    try { hidden = sessionStorage.getItem(K.updateHide) || ''; } catch (e) {}
-    if (hidden && cmpVersion(hidden, latest.version) === 0) return;
-
-    ensureUpdateUi();
-    if (!updHost) return;
-    updateTarget = latest;
-    updateShownVersion = latest.version;
-    const cmp = cmpVersion(latest.version, SCRIPT_VERSION);
-    updMsg.textContent = cmp > 0
-      ? '脚本有新版本 v' + latest.version + '（当前 v' + SCRIPT_VERSION + '）'
-      : 'GitHub 版本 v' + latest.version + ' 与当前 v' + SCRIPT_VERSION + ' 不一致';
-    updMsg.title = updMsg.textContent;
-    updHost.style.display = 'block';
   }
 
   async function githubJson(url) {
@@ -1157,50 +1000,19 @@
     return discoverRemote();
   }
 
-  async function checkUpdate(opts) {
-    opts = opts || {};
-    const now = Date.now();
-    const state = GM_getValue(K.updateState, null);
-    let latest = state && state.latest && typeof state.latest.version === 'string' ? state.latest : null;
-    const fresh = !!(state && typeof state.at === 'number' && now - state.at < UPDATE.ttl);
-
-    let failed = false;
-    if (opts.force || !latest || !fresh) {
-      try {
-        latest = await fetchLatestFromGitHub();
-        GM_setValue(K.updateState, { at: now, latest });
-      } catch (e) {
-        failed = true; // 失败时沿用上次缓存（如果有）
-      }
+  async function checkForUpdate() {
+    let latest;
+    try {
+      latest = await fetchLatestFromGitHub();
+    } catch (e) {
+      alert('检查失败：无法访问 GitHub（raw 与 jsDelivr），请检查网络后重试。');
+      return;
     }
-
-    if (!latest || !latest.version) {
-      if (opts.onResult) opts.onResult('error', null, true);
-      return { status: 'error', latest: null };
+    if (!latest || !latest.version || cmpVersion(latest.version, SCRIPT_VERSION) <= 0) {
+      alert('已是最新版本 v' + SCRIPT_VERSION);
+      return;
     }
-
-    const cmp = cmpVersion(latest.version, SCRIPT_VERSION);
-    if (cmp === 0) {
-      if (opts.onResult) opts.onResult('latest', latest, failed);
-      return { status: 'latest', latest };
-    }
-
-    showUpdatePill(latest);
-    if (opts.onResult) opts.onResult('update', latest, failed);
-    return { status: 'update', latest };
-  }
-
-  function scheduleUpdateCheck() {
-    if (!IS_TOP) return;
-    const idle = window.requestIdleCallback
-      ? (fn => window.requestIdleCallback(fn, { timeout: 5000 }))
-      : (fn => setTimeout(fn, 2500));
-    idle(() => {
-      if (updateCheckPromise) return;
-      updateCheckPromise = checkUpdate({}).catch(() => {}).finally(() => {
-        updateCheckPromise = null;
-      });
-    });
+    openUrl(latest.url);
   }
 
   /* ================= 8. 可视化设置面板 ================= */
@@ -1660,7 +1472,6 @@
     if (!el) return null;
     const root = el.getRootNode();
     if (bubbleShadow && root === bubbleShadow) return null;
-    if (updShadow && root === updShadow) return null;
     if (setShadow && root === setShadow) return null;
     if (el.closest(EDITABLE_SELECTOR)) return null;
     if (document.designMode && String(document.designMode).toLowerCase() === 'on') return null;
@@ -1698,7 +1509,6 @@
     if (!bubbleIsVisible()) return;
     const path = e.composedPath ? e.composedPath() : [];
     if (bubbleHost && path.indexOf(bubbleHost) !== -1) return;
-    if (updHost && path.indexOf(updHost) !== -1) return;
     if (setHost && path.indexOf(setHost) !== -1) return;
     if (e.button === 0) hideBubble();
   }
@@ -1708,7 +1518,6 @@
     isMouseSelecting = false;
     const path = e.composedPath ? e.composedPath() : [];
     if (bubbleHost && path.indexOf(bubbleHost) !== -1) return;
-    if (updHost && path.indexOf(updHost) !== -1) return;
     if (setHost && path.indexOf(setHost) !== -1) return;
     setTimeout(() => {
       const info = readSelection();
@@ -1726,7 +1535,6 @@
       return;
     }
     hideBubble();
-    hideUpdatePill();
   }
 
   function onPageScroll() {
@@ -1774,19 +1582,8 @@
   function registerMenus() {
     menu('打开设置面板', openSettings);
 
-    menu('检查脚本更新（GitHub）', () => {
-      checkUpdate({
-        force: true,
-        onResult: (status, latest, failed) => {
-          if (status === 'error') {
-            alert('检查失败：无法访问 GitHub（raw）与 jsDelivr，请检查网络后重试。');
-          } else if (status === 'latest') {
-            alert(failed ? '网络检查失败，沿用上次缓存：当前仍是最新版本 v' + SCRIPT_VERSION : '已是最新版本 v' + SCRIPT_VERSION);
-          } else {
-            alert((failed ? '网络检查失败，以下为上次缓存结果：' : '') + 'GitHub v' + latest.version + ' / 当前 v' + SCRIPT_VERSION + '。已显示更新按钮。');
-          }
-        },
-      }).catch(() => {});
+    menu('更新', () => {
+      checkForUpdate().catch(() => {});
     });
   }
 
@@ -1805,7 +1602,6 @@
     window.addEventListener('pointerup', onPointerUp, true);
     document.addEventListener('selectionchange', onSelectionChange);
     warmupEngines();
-    scheduleUpdateCheck();
   }
 
   if (document.readyState === 'loading') {
