@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Selection Translator
 // @namespace    specdock.my-script.selection-translator
-// @version      1.3.1
-// @description  静默划词翻译：中文→英文，其他→中文。Google → Microsoft → 腾讯翻译 → MyMemory → LLM 多级自动回退；可视化设置面板；GitHub 版本检测与一键更新。
+// @version      1.4.0
+// @description  静默划词翻译：中文→英文，其他→中文。Google / 微软 / 腾讯 → 火山 / 有道 / 彩云 → MyMemory 分批并发回退，LLM 兜底；可视化设置面板；GitHub 版本检测与一键更新。
 // @author       SpecDock
 // @match        *://*/*
 // @run-at       document-idle
@@ -16,6 +16,9 @@
 // @connect      edge.microsoft.com
 // @connect      api-edge.cognitive.microsofttranslator.com
 // @connect      transmart.qq.com
+// @connect      translate.volcengine.com
+// @connect      aidemo.youdao.com
+// @connect      api.interpreter.caiyunai.com
 // @connect      api.mymemory.translated.net
 // @connect      raw.githubusercontent.com
 // @connect      cdn.jsdelivr.net
@@ -32,7 +35,7 @@
 
   const SCRIPT_NAME = 'Selection Translator';
   const SCRIPT_NS = 'specdock.my-script.selection-translator';
-  const FALLBACK_VERSION = '1.3.1';
+  const FALLBACK_VERSION = '1.4.0';
   const SCRIPT_VERSION = (() => {
     try {
       return (typeof GM_info !== 'undefined' && GM_info.script && GM_info.script.version) || FALLBACK_VERSION;
@@ -44,15 +47,28 @@
     try { return window.top === window; } catch (e) { return false; }
   })();
 
-  const ENGINE_ORDER = ['google', 'ms', 'tencent', 'mymemory', 'llm'];
+  // 每批并发请求，批内第一个成功结果即为最终译文；全部失败才进入下一批，LLM 最后兜底
+  const ENGINE_BATCHES = [
+    ['google', 'ms', 'tencent'],
+    ['volc', 'youdao', 'caiyun'],
+    ['mymemory'],
+  ];
   const GOOGLE_TIMEOUT = 1500;
   const MS_TOKEN_TIMEOUT = 1800;
   const MS_TIMEOUT = 3000;
   const TENCENT_TIMEOUT = 2500;
+  const VOLC_TIMEOUT = 4000;
+  const YOUDAO_TIMEOUT = 2500;
+  const CAIYUN_TIMEOUT = 3000;
   const MYMEMORY_TIMEOUT = 2500;
   const LLM_TIMEOUT = 20000;
   const TENCENT_URL = 'https://transmart.qq.com/api/imt';
   const TENCENT_CLIENT_KEY = 'browser-chrome-120.0.0.0-Windows-6f1c2c9e-3f0b-4c3e-9d1a-2b7e5c8f4a11';
+  const VOLC_URL = 'https://translate.volcengine.com/crx/translate/v1/';
+  const YOUDAO_URL = 'https://aidemo.youdao.com/trans';
+  const CAIYUN_URL = 'https://api.interpreter.caiyunai.com/v1/translator';
+  // 彩云官方演示页公开的 token，可能被限流，仅作并发备胎
+  const CAIYUN_TOKEN = '3975l6lr5pcbvidl6jl2';
   const DOWN_MS = 5 * 60 * 1000;
   const MAX_LEN = 2500;
   const BUBBLE_GAP = 8;
@@ -171,6 +187,26 @@
     if (!key) return '未设置';
     if (key.length <= 8) return key.slice(0, 1) + '****' + key.slice(-1);
     return key.slice(0, 4) + '****' + key.slice(-4);
+  }
+
+  // 各免费接口按字/字节限长，CJK 计 1.5 权重更接近实际阈值
+  function inputWeight(text) {
+    let w = 0;
+    for (let i = 0; i < text.length; i++) {
+      w += text.charCodeAt(i) > 0x2e7f ? 1.5 : 1;
+    }
+    return w;
+  }
+
+  function skipError(message) {
+    const err = new Error(message);
+    err.skipDown = true;
+    return err;
+  }
+
+  function sameText(a, b) {
+    const norm = s => String(s || '').replace(/\s+/g, ' ').trim().toLowerCase();
+    return norm(a) === norm(b);
   }
 
   function parseMeta(src) {
@@ -348,6 +384,7 @@
   }
 
   async function tencentTranslate(text, target) {
+    if (inputWeight(text) > 520) throw skipError('tencent too long');
     const body = {
       header: { fn: 'auto_translation', client_key: TENCENT_CLIENT_KEY },
       type: 'plain',
@@ -374,19 +411,70 @@
     return { text: out, detected: typeof data.src_lang === 'string' ? data.src_lang : '' };
   }
 
+  async function volcTranslate(text, target) {
+    if (inputWeight(text) > 2400) throw skipError('volc too long');
+    const res = await gmRequest({
+      url: VOLC_URL,
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      data: JSON.stringify({
+        source_language: target === 'en' ? 'zh' : 'auto',
+        target_language: target === 'en' ? 'en' : 'zh',
+        text,
+      }),
+      timeout: VOLC_TIMEOUT,
+    });
+    if (res.status !== 200) throw new Error('volc http ' + res.status);
+    let data;
+    try { data = JSON.parse(res.responseText); } catch (e) { throw new Error('volc parse'); }
+    if (data && data.base_resp && Number(data.base_resp.status_code) !== 0) throw new Error('volc error');
+    const out = data && typeof data.translation === 'string' ? data.translation.trim() : '';
+    if (!out) throw new Error('volc empty');
+    return { text: out, detected: typeof data.detected_language === 'string' ? data.detected_language : '' };
+  }
+
+  async function youdaoTranslate(text, target) {
+    if (inputWeight(text) > 400) throw skipError('youdao too long');
+    const url = YOUDAO_URL + '?q=' + encodeURIComponent(text) + '&from=Auto&to=' + (target === 'en' ? 'en' : 'zh-CHS');
+    const res = await gmRequest({ url, timeout: YOUDAO_TIMEOUT });
+    if (res.status !== 200) throw new Error('youdao http ' + res.status);
+    let data;
+    try { data = JSON.parse(res.responseText); } catch (e) { throw new Error('youdao parse'); }
+    if (!data || String(data.errorCode) !== '0') throw new Error('youdao error ' + (data && data.errorCode));
+    const out = Array.isArray(data.translation) ? String(data.translation[0] || '').trim() : '';
+    if (!out) throw new Error('youdao empty');
+    return { text: out, detected: typeof data.l === 'string' ? data.l.split('2')[0] : '' };
+  }
+
+  async function caiyunTranslate(text, target) {
+    if (inputWeight(text) > 4500) throw skipError('caiyun too long');
+    if (target === 'zh' && !/[A-Za-z]/.test(text)) throw skipError('caiyun source unknown');
+    const res = await gmRequest({
+      url: CAIYUN_URL,
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'x-authorization': 'token ' + CAIYUN_TOKEN },
+      data: JSON.stringify({
+        source: [text],
+        trans_type: target === 'en' ? 'zh2en' : 'en2zh',
+        request_id: 'selection-translator',
+        detect: true,
+      }),
+      timeout: CAIYUN_TIMEOUT,
+    });
+    if (res.status !== 200) throw new Error('caiyun http ' + res.status);
+    let data;
+    try { data = JSON.parse(res.responseText); } catch (e) { throw new Error('caiyun parse'); }
+    if (!data || Number(data.rc) !== 0) throw new Error('caiyun error');
+    const out = Array.isArray(data.target) ? String(data.target[0] || '').trim() : '';
+    if (!out) throw new Error('caiyun empty');
+    return { text: out, detected: target === 'en' ? 'zh' : 'en' };
+  }
+
   async function myMemoryTranslate(text, target) {
     // 免费接口单次上限约 500 字节，且只支持明确的中英语种对；不满足时跳过但不熔断
     const bytes = typeof TextEncoder === 'function' ? new TextEncoder().encode(text).length : text.length;
-    if (bytes > 480) {
-      const err = new Error('mymemory too long');
-      err.skipDown = true;
-      throw err;
-    }
-    if (target === 'zh' && !/[A-Za-z]/.test(text)) {
-      const err = new Error('mymemory source unknown');
-      err.skipDown = true;
-      throw err;
-    }
+    if (bytes > 480) throw skipError('mymemory too long');
+    if (target === 'zh' && !/[A-Za-z]/.test(text)) throw skipError('mymemory source unknown');
     const pair = target === 'en' ? 'zh-CN|en' : 'en|zh-CN';
     const url = 'https://api.mymemory.translated.net/get?q=' + encodeURIComponent(text) + '&langpair=' + encodeURIComponent(pair);
     const res = await gmRequest({ url, timeout: MYMEMORY_TIMEOUT });
@@ -415,20 +503,13 @@
   }
 
   async function llmTranslate(text, target) {
-    const langName = target === 'en' ? 'English' : 'Simplified Chinese';
     const body = {
       model: cfg.model || 'deepseek-flash',
       messages: [
-        {
-          role: 'system',
-          content: 'You are a precise translation engine. Translate the user text faithfully. Output only the translated text, without quotes, labels or explanations.',
-        },
-        {
-          role: 'user',
-          content: 'Translate the following text into ' + langName + ':\n\n' + text,
-        },
+        { role: 'system', content: '你是翻译引擎，只输出译文。' },
+        { role: 'user', content: '翻译成' + (target === 'en' ? '英文' : '中文') + '：\n' + text },
       ],
-      temperature: 0.2,
+      temperature: 0,
       stream: false,
     };
     const res = await gmRequest({
@@ -462,8 +543,10 @@
     google: googleTranslate,
     ms: msTranslate,
     tencent: tencentTranslate,
+    volc: volcTranslate,
+    youdao: youdaoTranslate,
+    caiyun: caiyunTranslate,
     mymemory: myMemoryTranslate,
-    llm: llmTranslate,
   };
 
   /* ================= 5. 引擎调度与缓存 ================= */
@@ -502,19 +585,47 @@
     saveDownState();
   }
 
+  function runBatch(names, text, target) {
+    return new Promise(resolve => {
+      let pending = names.length;
+      let settled = false;
+      for (const name of names) {
+        ENGINES[name](text, target).then(res => {
+          if (!res || !res.text) throw new Error('empty');
+          if (res.text.length >= 12 && sameText(res.text, text)) throw new Error('unchanged');
+          markUp(name);
+          if (!settled) {
+            settled = true;
+            resolve(res);
+          }
+        }).catch(e => {
+          if (!e.skipDown) markDown(name);
+          if (!settled && --pending === 0) {
+            settled = true;
+            resolve(null);
+          }
+        });
+      }
+    });
+  }
+
   async function runChain(text, target) {
     let lastErr = null;
-    for (const name of ENGINE_ORDER) {
-      if (name === 'llm' && !llmReady()) continue;
-      const down = downUntil[name];
-      if (down && down > Date.now()) continue;
+    for (const batch of ENGINE_BATCHES) {
+      const active = batch.filter(name => !(downUntil[name] > Date.now()));
+      if (!active.length) continue;
+      const res = await runBatch(active, text, target);
+      if (res) return res;
+      lastErr = lastErr || new Error('机器翻译均失败');
+    }
+    if (llmReady() && !(downUntil.llm > Date.now())) {
       try {
-        const res = await ENGINES[name](text, target);
-        if (!res || !res.text) throw new Error('empty');
-        markUp(name);
+        const res = await llmTranslate(text, target);
+        if (!res || !res.text) throw new Error('llm empty');
+        markUp('llm');
         return res;
       } catch (e) {
-        if (!e.skipDown) markDown(name);
+        if (!e.skipDown) markDown('llm');
         lastErr = e;
       }
     }
@@ -1344,7 +1455,7 @@
     head.appendChild(btnMin);
     head.appendChild(btnClose);
 
-    const sub = make('p', 'sub', 'Google → Microsoft → 腾讯翻译 → MyMemory → LLM 自动回退。配置仅保存在篡改猴本地。');
+    const sub = make('p', 'sub', 'Google / 微软 / 腾讯 → 火山 / 有道 / 彩云 → MyMemory，按批并发、取最先成功结果，LLM 最后兜底。配置仅保存在篡改猴本地。');
 
     const urlField = make('div', 'field');
     const urlRow = make('div', 'label-row');
@@ -1638,14 +1749,14 @@
       ? (fn => window.requestIdleCallback(fn, { timeout: 4000 }))
       : (fn => setTimeout(fn, 1200));
     idle(() => {
-      if (!(downUntil.google > Date.now())) {
-        googleTranslate('hello', 'zh').then(() => markUp('google')).catch(() => markDown('google'));
-      }
       if (!(downUntil.ms > Date.now())) {
         getMsToken()
           .then(() => msTranslate('hi', 'zh'))
           .then(() => markUp('ms'))
           .catch(() => markDown('ms'));
+      }
+      if (!(downUntil.tencent > Date.now())) {
+        tencentTranslate('hello', 'zh').then(() => markUp('tencent')).catch(() => markDown('tencent'));
       }
     });
   }
