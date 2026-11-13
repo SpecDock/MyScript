@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         超星通用课程截止提醒
 // @namespace    chaoxing-deadline
-// @version      2.9.1
-// @description  通用课程（含新版）和课程都读取：列出还没截止的作业和考试（含未设置截止时间的），单列最近30天已结束且未作答的作业，另列出未结课且章节没看完的课程；菜单一键更新
+// @version      3.0.0
+// @description  通用课程（含新版）和课程都读取：列出还没截止的作业和考试（含未设置截止时间的），单列已结束作业（含时间未知），另列出未结课且章节没看完的课程；支持搜索筛选、结果记忆、取消扫描和失败摘要；菜单一键更新
 // @author       specdock
 // @match        https://mooc1-2.chaoxing.com/visit/courses*
 // @match        https://mooc1-2.chaoxing.com/mooc-ans/visit/courses*
@@ -34,6 +34,8 @@
 // @grant        GM_registerMenuCommand
 // @grant        GM_openInTab
 // @grant        GM_info
+// @grant        GM_getValue
+// @grant        GM_setValue
 // @updateURL    https://raw.githubusercontent.com/SpecDock/MyScript/master/chaoxing-deadline-reminder.user.js
 // @downloadURL  https://raw.githubusercontent.com/SpecDock/MyScript/master/chaoxing-deadline-reminder.user.js
 // @run-at       document-idle
@@ -111,6 +113,9 @@
       min-height: 30px;
     }
     #cx-deadline.is-min .cx-rz { display: none; }
+    #cx-deadline.is-min .cx-tools,
+    #cx-deadline.is-min .cx-alert,
+    #cx-deadline.is-min .cx-hint { display: none !important; }
     #cx-deadline .cx-bar {
       flex: 0 0 30px;
       height: 30px;
@@ -173,7 +178,8 @@
     #cx-deadline table.cx-tasks th:nth-child(3) { width: 27%; }
     #cx-deadline table.cx-ended th:nth-child(1) { width: 26%; }
     #cx-deadline table.cx-ended th:nth-child(3) { width: 29%; }
-    #cx-deadline table.cx-chapters th:nth-child(2) { width: 38%; }
+    #cx-deadline table.cx-chapters th:nth-child(2) { width: 24%; }
+    #cx-deadline table.cx-chapters th:nth-child(3) { width: 30%; }
     #cx-deadline table.cx-tasks td:last-child,
     #cx-deadline table.cx-ended td:last-child,
     #cx-deadline table.cx-chapters td:last-child { font-size: 11px; }
@@ -223,6 +229,82 @@
     }
     #cx-deadline.is-min .cx-log { display: none !important; }
     #cx-deadline .cx-empty { padding: 12px 8px; text-align: center; color: #64748b; }
+    #cx-deadline .cx-tools {
+      flex: 0 0 auto;
+      display: flex;
+      align-items: center;
+      flex-wrap: wrap;
+      gap: 5px 6px;
+      padding: 4px 8px;
+      background: #f8fafc;
+      border-bottom: 1px solid #e5e7eb;
+    }
+    #cx-deadline .cx-tools[hidden], #cx-deadline .cx-alert[hidden], #cx-deadline .cx-hint[hidden] { display: none; }
+    #cx-deadline .cx-search {
+      flex: 1 1 180px;
+      min-width: 120px;
+      height: 24px;
+      padding: 0 8px;
+      border: 1px solid #cbd5e1;
+      border-radius: 5px;
+      background: #fff;
+      color: #1f2937;
+      font: 12px/22px "Microsoft YaHei", "PingFang SC", sans-serif;
+      outline: none;
+    }
+    #cx-deadline .cx-search:focus { border-color: #1e3a5f; box-shadow: 0 0 0 2px rgba(30, 58, 95, .14); }
+    #cx-deadline .cx-chips { display: flex; gap: 4px; flex-wrap: wrap; }
+    #cx-deadline .cx-chip {
+      border: 1px solid #cbd5e1;
+      background: #fff;
+      color: #475569;
+      border-radius: 999px;
+      height: 24px;
+      padding: 0 9px;
+      font: 11px/22px "Microsoft YaHei", "PingFang SC", sans-serif;
+      cursor: pointer;
+    }
+    #cx-deadline .cx-chip:hover { border-color: #1e3a5f; color: #1e3a5f; }
+    #cx-deadline .cx-chip.is-on { background: #1e3a5f; border-color: #1e3a5f; color: #fff; }
+    #cx-deadline .cx-last { margin-left: auto; color: #64748b; font-size: 11px; white-space: nowrap; }
+    #cx-deadline .cx-alert {
+      flex: 0 0 auto;
+      padding: 5px 8px;
+      background: #fff7ed;
+      color: #9a3412;
+      border-bottom: 1px solid #fed7aa;
+      font-size: 11px;
+      cursor: pointer;
+    }
+    #cx-deadline .cx-alert:hover { background: #ffedd5; }
+    #cx-deadline .cx-hint {
+      flex: 0 0 auto;
+      padding: 5px 8px;
+      background: #eff6ff;
+      color: #1d4ed8;
+      border-bottom: 1px solid #bfdbfe;
+      font-size: 11px;
+      cursor: pointer;
+    }
+    #cx-deadline .cx-hint:hover { background: #dbeafe; }
+    #cx-deadline .cx-progress-wrap {
+      flex: 1 1 auto;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      gap: 12px;
+      padding: 24px 40px;
+    }
+    #cx-deadline .cx-progress { width: 100%; max-width: 440px; height: 6px; background: #e2e8f0; border-radius: 999px; overflow: hidden; }
+    #cx-deadline .cx-progress-fill { width: 0; height: 100%; background: #1e3a5f; border-radius: 999px; transition: width .25s ease; }
+    #cx-deadline .cx-progress-text { color: #475569; font-size: 12px; text-align: center; }
+    #cx-deadline .cx-toggle { cursor: pointer; user-select: none; }
+    #cx-deadline .cx-toggle:hover { color: #2b5480; }
+    #cx-deadline .cx-toggle .cx-caret { float: right; color: #64748b; font-size: 11px; }
+    @media (prefers-reduced-motion: reduce) {
+      #cx-deadline .cx-progress-fill { transition: none; }
+    }
   `);
 
   const panel = document.createElement('div');
@@ -234,6 +316,18 @@
       <button type="button" data-act="log" title="查看读取日志">☰</button>
       <button type="button" data-act="min" title="最小化">—</button>
     </div>
+    <div class="cx-tools" hidden>
+      <input type="search" class="cx-search" placeholder="搜索课程 / 作业 / 考试" autocomplete="off" spellcheck="false" aria-label="搜索课程、作业或考试">
+      <div class="cx-chips" role="group" aria-label="快捷筛选">
+        <button type="button" class="cx-chip is-on" data-filter="all">全部</button>
+        <button type="button" class="cx-chip" data-filter="hot">7天内</button>
+        <button type="button" class="cx-chip" data-filter="nodue">无截止</button>
+        <button type="button" class="cx-chip" data-filter="settled">已完成</button>
+      </div>
+      <span class="cx-last"></span>
+    </div>
+    <div class="cx-alert" hidden role="button" tabindex="0" title="查看失败详情"></div>
+    <div class="cx-hint" hidden role="button" tabindex="0"></div>
     <div class="cx-body"></div>
     <div class="cx-log" style="display:none"></div>
     <div class="cx-foot">拖动蓝条移动，拖动边框调整大小</div>
@@ -255,7 +349,13 @@
   const minBtn = panel.querySelector('[data-act="min"]');
   const logBtn = panel.querySelector('[data-act="log"]');
   const scanBtn = panel.querySelector('[data-act="scan"]');
-  const FALLBACK_VERSION = '2.9.1';
+  const toolsEl = panel.querySelector('.cx-tools');
+  const searchEl = panel.querySelector('.cx-search');
+  const lastEl = panel.querySelector('.cx-last');
+  const alertEl = panel.querySelector('.cx-alert');
+  const hintEl = panel.querySelector('.cx-hint');
+  const chipEls = Array.prototype.slice.call(panel.querySelectorAll('.cx-chip'));
+  const FALLBACK_VERSION = '3.0.0';
   const VERSION = (function () {
     try {
       if (typeof GM_info !== 'undefined' && GM_info && GM_info.script && GM_info.script.version) {
@@ -295,9 +395,52 @@
   });
   let rows = [];
   let endedRows = [];
+  let unknownRows = [];
   let chapterRows = [];
   let minimized = false;
   let loading = false;
+  let lastScanTs = null;
+  let failedCourses = [];
+  let searchText = '';
+  let filterMode = 'all';
+  let unknownOpen = false;
+  let scannedKeys = '';
+  let restoringPanel = false;
+  let hintCheckTimer = 0;
+  let snapshotTimer = 0;
+
+  const STORE_PANEL = 'chaoxingDeadline.panel.v1';
+  const STORE_LAST_SCAN = 'chaoxingDeadline.lastScan.v1';
+
+  function gmGet(key, def) {
+    try {
+      if (typeof GM_getValue === 'function') {
+        const v = GM_getValue(key, def);
+        return v == null ? def : v;
+      }
+    } catch (e) { /* ignore */ }
+    return def;
+  }
+
+  function gmSet(key, value) {
+    try {
+      if (typeof GM_setValue === 'function') GM_setValue(key, value);
+    } catch (e) { /* ignore */ }
+  }
+
+  function formatClock(ms) {
+    const d = new Date(ms);
+    return ('0' + d.getHours()).slice(-2) + ':' + ('0' + d.getMinutes()).slice(-2);
+  }
+
+  function hasResults() {
+    return !!(rows.length || endedRows.length || unknownRows.length || chapterRows.length);
+  }
+
+  function updateTools() {
+    toolsEl.hidden = !(lastScanTs || hasResults());
+    lastEl.textContent = lastScanTs ? '上次扫描 ' + formatClock(lastScanTs) : '';
+  }
 
   // 拖拽调整过大小后宽高是内联的，会盖掉 .is-min 的固定尺寸，最小化前先存起来。
   let savedSize = null;
@@ -305,7 +448,11 @@
   function setMinimized(next) {
     if (next === minimized) return;
     if (next) {
-      savedSize = { width: panel.style.width, height: panel.style.height };
+      const rect = panel.getBoundingClientRect();
+      savedSize = {
+        width: panel.style.width || (Math.round(rect.width) + 'px'),
+        height: panel.style.height || (Math.round(rect.height) + 'px')
+      };
       panel.style.width = '';
       panel.style.height = '';
     } else if (savedSize) {
@@ -319,6 +466,47 @@
     footEl.style.display = minimized ? 'none' : '';
     minBtn.textContent = minimized ? '□' : '—';
     minBtn.title = minimized ? '还原' : '最小化';
+    if (hasResults()) updateTitle();
+    savePanelState();
+  }
+
+  function savePanelState() {
+    if (restoringPanel) return;
+    const rect = panel.getBoundingClientRect();
+    let width = Math.round(rect.width);
+    let height = Math.round(rect.height);
+    if (minimized && savedSize && savedSize.width) {
+      width = Math.round(parseFloat(savedSize.width) || width);
+      height = Math.round(parseFloat(savedSize.height) || height);
+    }
+    gmSet(STORE_PANEL, {
+      left: Math.round(rect.left),
+      top: Math.round(rect.top),
+      width: width,
+      height: height,
+      min: minimized
+    });
+  }
+
+  function restorePanelState() {
+    const state = gmGet(STORE_PANEL, null);
+    if (!state || typeof state !== 'object') return;
+    restoringPanel = true;
+    const vw = window.innerWidth;
+    const vh = window.innerHeight;
+    if (isFinite(state.width) && state.width > 0) {
+      panel.style.width = Math.min(Math.max(320, state.width), Math.max(320, vw - 8)) + 'px';
+    }
+    if (isFinite(state.height) && state.height > 0) {
+      panel.style.height = Math.min(Math.max(120, state.height), Math.max(120, vh - 8)) + 'px';
+    }
+    if (isFinite(state.left) && isFinite(state.top)) {
+      panel.style.right = 'auto';
+      panel.style.left = Math.min(Math.max(0, state.left), Math.max(0, vw - 100)) + 'px';
+      panel.style.top = Math.min(Math.max(0, state.top), Math.max(0, vh - 38)) + 'px';
+    }
+    if (state.min) setMinimized(true);
+    restoringPanel = false;
   }
 
   minBtn.addEventListener('click', function (e) {
@@ -333,22 +521,57 @@
 
   function renderIdle() {
     titleEl.textContent = '点击「▶ 扫描」开始';
+    toolsEl.hidden = true;
+    alertEl.hidden = true;
+    hintEl.hidden = true;
     bodyEl.innerHTML = '<div class="cx-start">'
       + '<button type="button" data-act="start">▶ 开始扫描</button>'
-      + '<p>只读取当前页面可见的课程（课程页按当前学期筛选）<br>读取作业、考试（含无截止时间）与未看完章节，另列最近30天已结束且未作答的作业</p></div>';
+      + '<p>只读取当前页面可见的课程（课程页按当前学期筛选）<br>读取作业、考试（含无截止时间）与未看完章节，单列已结束作业（含时间未知）<br>扫描可随时取消，结果会自动记住</p></div>';
     const b = bodyEl.querySelector('[data-act="start"]');
     if (b) b.addEventListener('click', function (e) { e.stopPropagation(); startScan(); });
   }
 
   function startScan() {
-    if (loading) return;
-    setScanBtn('⟳ 扫描中', true);
+    if (loading) { cancelScan(); return; }
+    hintEl.hidden = true;
+    alertEl.hidden = true;
+    setScanBtn('✕ 取消扫描', false);
+    scanBtn.title = '点击取消当前扫描';
     scan();
   }
 
   scanBtn.addEventListener('click', function (e) {
     e.stopPropagation();
     startScan();
+  });
+
+  searchEl.addEventListener('input', function () {
+    searchText = searchEl.value.trim();
+    if (!loading) render();
+  });
+
+  chipEls.forEach(function (chip) {
+    chip.addEventListener('click', function (e) {
+      e.stopPropagation();
+      filterMode = chip.getAttribute('data-filter') || 'all';
+      chipEls.forEach(function (c) { c.classList.toggle('is-on', c === chip); });
+      if (!loading) render();
+    });
+  });
+
+  function toggleLog(show) {
+    const next = show == null ? logEl.style.display === 'none' : !!show;
+    logEl.style.display = next ? '' : 'none';
+    if (next) renderLog();
+  }
+
+  alertEl.addEventListener('click', function () { toggleLog(true); });
+  alertEl.addEventListener('keydown', function (e) {
+    if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); toggleLog(true); }
+  });
+  hintEl.addEventListener('click', function () { hintEl.hidden = true; startScan(); });
+  hintEl.addEventListener('keydown', function (e) {
+    if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); hintEl.hidden = true; startScan(); }
   });
 
   let dragging = false;
@@ -374,7 +597,12 @@
     panel.style.left = left + 'px';
     panel.style.top = top + 'px';
   });
-  document.addEventListener('mouseup', function () { dragging = false; });
+  document.addEventListener('mouseup', function () {
+    if (dragging) {
+      dragging = false;
+      savePanelState();
+    }
+  });
 
   // 八方向拖边框调整大小。用 pointer 事件，同时兼容鼠标和触屏。
   let resizing = null;
@@ -435,9 +663,24 @@
     panel.style.top = top + 'px';
   });
 
-  function stopResize() { resizing = null; }
+  function stopResize() {
+    if (resizing) {
+      resizing = null;
+      savePanelState();
+    }
+  }
   document.addEventListener('pointerup', stopResize);
   document.addEventListener('pointercancel', stopResize);
+
+  window.addEventListener('resize', function () {
+    if (minimized) return;
+    if (panel.style.left) {
+      const maxL = Math.max(0, window.innerWidth - 100);
+      const maxT = Math.max(0, window.innerHeight - 38);
+      panel.style.left = Math.min(maxL, Math.max(0, parseFloat(panel.style.left) || 0)) + 'px';
+      panel.style.top = Math.min(maxT, Math.max(0, parseFloat(panel.style.top) || 0)) + 'px';
+    }
+  });
 
   function headerValue(res, name) {
     const raw = res.responseHeaders || '';
@@ -561,13 +804,30 @@
     });
   }
 
+  // 并发槽等待最多 30 秒：任何异常嵌套都不会把整轮扫描永久卡死。
   async function acquireSlot() {
     if (inflightTotal < MAX_INFLIGHT) {
       inflightTotal++;
       return;
     }
-    await new Promise(function (r) { slotWaiters.push(r); });
-    inflightTotal++;
+    await new Promise(function (resolve, reject) {
+      let done = false;
+      const waiter = function () {
+        if (done) return;
+        done = true;
+        clearTimeout(timer);
+        inflightTotal++;
+        resolve();
+      };
+      const timer = setTimeout(function () {
+        if (done) return;
+        done = true;
+        const i = slotWaiters.indexOf(waiter);
+        if (i >= 0) slotWaiters.splice(i, 1);
+        reject(new Error('等待并发槽超时'));
+      }, 30000);
+      slotWaiters.push(waiter);
+    });
   }
 
   function releaseSlot() {
@@ -577,7 +837,9 @@
   }
 
   // 发起时刻间隔：同步预占一个时间片，避免并发调用挤在同一毫秒上。
-  async function hostRequest(host, fn) {
+  // noSlot=true 表示重定向的后续跳：整条跳转链共用外层已经占住的一个并发槽，
+  // 不能再申请第二个，否则 26 条并发的重定向会互相等槽死锁。
+  async function hostRequest(host, fn, noSlot) {
     if (bannedHost[host]) throw new Error(host + ' 本轮已弃用');
     hostHits[host] = (hostHits[host] || 0) + 1;
     totalHits += 1;
@@ -590,11 +852,11 @@
     // 等待期间这个域名可能已经被弃用（命中反爬），立刻失败并顺延到下一个宿主，
     // 而不是把请求白发给一个必然被拦的域名。
     if (bannedHost[host]) throw new Error(host + ' 本轮已弃用');
-    await acquireSlot();
+    if (!noSlot) await acquireSlot();
     try {
       return await fn();
     } finally {
-      releaseSlot();
+      if (!noSlot) releaseSlot();
     }
   }
 
@@ -631,13 +893,13 @@
           const text = res.responseText || '';
           if (res.status >= 300 && res.status < 400 && loc && (hops || 0) < 6) {
             const next = absoluteUrl(landed, loc);
-            hostRequest(hostOf(next), function () { return rawRequest(next, (hops || 0) + 1); }).then(resolve, reject);
+            hostRequest(hostOf(next), function () { return rawRequest(next, (hops || 0) + 1); }, true).then(resolve, reject);
             return;
           }
           const jump = redirectInHtml(text);
           if (jump && (hops || 0) < 6) {
             const next = absoluteUrl(landed, jump);
-            hostRequest(hostOf(next), function () { return rawRequest(next, (hops || 0) + 1); }).then(resolve, reject);
+            hostRequest(hostOf(next), function () { return rawRequest(next, (hops || 0) + 1); }, true).then(resolve, reject);
             return;
           }
           // 走到这里说明 GM 自己把 302 跟完了：响应是落点域名发出来的，
@@ -887,6 +1149,10 @@
   const badEntry = {};
   const pageKey = location.pathname;
 
+  function resetBadEntry() {
+    Object.keys(badEntry).forEach(function (k) { delete badEntry[k]; });
+  }
+
   // 依次尝试候选入口，直到拿到完整课程门户参数。
   // step 是课程序号：门户入口必须按它轮换宿主，否则门户请求会全部压到 mooc1-2 上。
   async function openPortal(course, step) {
@@ -1128,6 +1394,62 @@
     return true;
   }
 
+  // 轻量读取「当前可见课程」的签名，只做本地 DOM 比较，不发请求。
+  // 学期/筛选变化后提示用户手动重扫，保持“只有点按钮才发请求”的省流原则。
+  function currentCourseKeys() {
+    const keys = [];
+    const add = function (id, clazz) {
+      if (id && clazz) keys.push(id + ':' + clazz);
+    };
+    document.querySelectorAll('li.courseItem').forEach(function (li) {
+      if (!isShown(li)) return;
+      const cid = (li.querySelector('input[name="courseId"]') || {}).value || '';
+      const clazz = (li.querySelector('input[name="classId"]') || {}).value || '';
+      add(cid, clazz);
+    });
+    document.querySelectorAll('.courselistArea .course, .course.learnCourse').forEach(function (el) {
+      if (!isShown(el)) return;
+      const val = function (sel) {
+        const x = el.querySelector(sel);
+        return (x && x.value ? x.value : '').trim();
+      };
+      const info = el.getAttribute('info') || '';
+      const cid = val('input[name="courseId"], input.courseId');
+      const clazz = val('input[name="clazzId"], input.clazzId') || (info.split('_')[0] || '');
+      add(cid, clazz);
+    });
+    document.querySelectorAll('#courseList li.course').forEach(function (li) {
+      if (!isShown(li)) return;
+      const a = li.querySelector('a.color1, a[href*="courseid="]');
+      if (!a) return;
+      const cid = (a.href.match(/[?&](?:courseid|courseId)=(\d+)/) || [])[1];
+      const clazz = (a.href.match(/[?&](?:clazzid|clazzId)=(\d+)/) || [])[1];
+      add(cid, clazz);
+    });
+    document.querySelectorAll('li.w_couritem').forEach(function (li) {
+      if (!isShown(li)) return;
+      add(li.getAttribute('cid'), li.getAttribute('classid'));
+    });
+    const unique = keys.filter(function (k, i) { return keys.indexOf(k) === i; });
+    return unique.sort().join('|');
+  }
+
+  function scheduleHintCheck() {
+    clearTimeout(hintCheckTimer);
+    hintCheckTimer = setTimeout(function () {
+      if (loading || !lastScanTs) return;
+      const cur = currentCourseKeys();
+      if (cur && cur !== scannedKeys) {
+        if (hintEl.hidden) {
+          hintEl.textContent = '课程列表或学期筛选已变化，点此重新扫描';
+          hintEl.hidden = false;
+        }
+      } else if (!hintEl.hidden) {
+        hintEl.hidden = true;
+      }
+    }, 700);
+  }
+
   // 卡片上的结课标记。通用课程页用文字「已开启结课模式」，课程页用 state=1 / .not-open-tip。
   function detectEnded(cardText, el) {
     const t = String(cardText || '');
@@ -1207,10 +1529,9 @@
       const status = ((li.querySelector('.status') || {}).textContent || '').replace(/\s+/g, '');
       const timeText = ((li.querySelector('.time') || {}).textContent || '').replace(/\s+/g, '');
       if (!name) return;
-      if (/已过期|已失效|已结束/.test(status)) return;
       const settled = /待批阅|待批改|已完成|已批阅/.test(status);
       let deadline = parseDeadline(timeText, now);
-      let ended = /已结束|已截止|已过期/.test(timeText);
+      let ended = /已结束|已截止|已过期/.test(timeText) || /已结束|已失效|已过期/.test(status);
       let endTime = null;
       if (deadline != null && deadline <= now) {
         ended = true;
@@ -1238,10 +1559,9 @@
       const status = textOf(part.match(/class="status[^"]*"[^>]*>([\s\S]*?)<\/p>/i)).replace(/\s+/g, '');
       const timeText = textOf(part.match(/class="time[^"]*"[^>]*>([\s\S]*?)<\/div>/i)).replace(/\s+/g, '');
       if (!name) return;
-      if (/已过期|已失效|已结束/.test(status)) return;
       const settled = /待批阅|待批改|已完成|已批阅/.test(status);
       let deadline = parseDeadline(timeText, now);
-      let ended = /已结束|已截止|已过期/.test(timeText);
+      let ended = /已结束|已截止|已过期/.test(timeText) || /已结束|已失效|已过期/.test(status);
       let endTime = null;
       if (deadline != null && deadline <= now) {
         ended = true;
@@ -1369,25 +1689,31 @@
     return list;
   }
 
-  // 把作业拆成「还要提醒的」和「最近 30 天已结束且未作答的」。
-  // 已结束但没有结束时间的（详情页也读不到）既不放进提醒，也不放进已结束分区。
+  // 把作业拆成「还要提醒的」「最近 30 天已结束且未作答的」和「已结束但时间未知的」。
+  // 时间未知的单独进折叠区，不再静默丢弃。
   function splitEndedWorks(list, now) {
     const active = [];
     const ended = [];
+    const unknown = [];
     let older = 0;
     list.forEach(function (r) {
       if (!r.ended) {
         active.push(r);
         return;
       }
-      if (r.kind === '作业' && !r.settled && r.endTime != null
-        && r.endTime <= now && r.endTime >= now - THIRTY_DAYS) {
-        ended.push(r);
-      } else {
-        older += 1;
+      if (r.kind === '作业' && !r.settled) {
+        if (r.endTime == null) {
+          unknown.push(r);
+        } else if (r.endTime <= now && r.endTime >= now - THIRTY_DAYS) {
+          ended.push(r);
+        } else {
+          older += 1;
+        }
+        return;
       }
+      older += 1;
     });
-    return { active: active, ended: ended, older: older };
+    return { active: active, ended: ended, unknown: unknown, older: older };
   }
 
 
@@ -1603,7 +1929,7 @@
   // 并行之后每门课只有 2 步（门户 → 三个数据页同时），耗时明显下降。
   async function loadCourse(course, idx, opts) {
     opts = opts || {};
-    const out = { work: null, workEnded: null, exam: null, chapter: null, failed: [], portal: null, noData: false, pendingSettled: [] };
+    const out = { work: null, workEnded: null, workUnknown: null, exam: null, chapter: null, failed: [], portal: null, noData: false, pendingSettled: [] };
     if (course.ended) return out;
     const p = opts.portal || await openPortal(course, idx);
     out.portal = p;
@@ -1641,10 +1967,11 @@
           const split = splitEndedWorks(resolved.filter(function (r) { return !r.pendingConfirm; }), now);
           out.work = split.active;
           out.workEnded = split.ended;
+          out.workUnknown = split.unknown;
           out.pendingSettled = pendingSettled;
-          if (split.older) log(label + ' 另有 ' + split.older + ' 条已结束（含已完成/待批阅）或结束时间未知，不列出');
+          if (split.older) log(label + ' 另有 ' + split.older + ' 条已结束（含已完成/待批阅）或超出30天，不列出');
           log(label + ' 解析出未截止 ' + out.work.length + ' 条，最近30天已结束未作答 '
-            + out.workEnded.length + ' 条（共 ' + got.pages + ' 页）'
+            + out.workEnded.length + ' 条，已结束但时间未知 ' + out.workUnknown.length + ' 条（共 ' + got.pages + ' 页）'
             + (out.work.length ? ' 首条=' + out.work[0].work + ' ' + out.work[0].status : '')
             + (pendingSettled.length ? '，另有 ' + pendingSettled.length + ' 条已完成/待批阅待后台确认' : ''));
         } catch (e) {
@@ -1731,9 +2058,62 @@
     return (hours >= 1 ? hours + '小时前' : Math.max(1, Math.floor(diff / 60000)) + '分钟前');
   }
 
+  let progressFill = null;
+  let progressText = null;
+
+  function matchesText(value) {
+    if (!searchText) return true;
+    return String(value || '').toLowerCase().indexOf(searchText.toLowerCase()) >= 0;
+  }
+
+  function matchesChip(r) {
+    if (filterMode === 'hot') return !r.settled && r.deadline != null && r.deadline - Date.now() < SEVEN_DAYS;
+    if (filterMode === 'nodue') return r.deadline == null;
+    if (filterMode === 'settled') return !!r.settled;
+    return true;
+  }
+
+  function isFiltering() {
+    return !!searchText || filterMode !== 'all';
+  }
+
+  function showProgress(total) {
+    progressFill = null;
+    progressText = null;
+    titleEl.textContent = '正在读取 0/' + total;
+    bodyEl.innerHTML = '<div class="cx-progress-wrap">'
+      + '<div class="cx-progress" role="progressbar" aria-label="扫描进度" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0">'
+      + '<div class="cx-progress-fill"></div></div>'
+      + '<div class="cx-progress-text" aria-live="polite">正在读取 0/' + total + '…</div></div>';
+    progressFill = bodyEl.querySelector('.cx-progress-fill');
+    progressText = bodyEl.querySelector('.cx-progress-text');
+  }
+
+  function updateProgress(done, total, name) {
+    const pct = total ? Math.round(done / total * 100) : 0;
+    if (progressFill) {
+      progressFill.style.width = pct + '%';
+      const bar = progressFill.parentElement;
+      if (bar) bar.setAttribute('aria-valuenow', String(pct));
+    }
+    if (progressText) {
+      progressText.textContent = '正在读取 ' + done + '/' + total
+        + (name ? ' · 刚完成：' + name : '');
+    }
+    titleEl.textContent = '正在读取 ' + done + '/' + total;
+  }
+
+  function updateTitle() {
+    const endedPart = endedRows.length ? ' · 已结束 ' + endedRows.length : '';
+    const unknownPart = unknownRows.length ? ' · 未知 ' + unknownRows.length : '';
+    titleEl.textContent = (minimized
+      ? ('未截止 ' + rows.length + endedPart + unknownPart + ' · 章节 ' + chapterRows.length)
+      : ('未截止 ' + rows.length + ' 项' + endedPart + unknownPart + ' · 未看完章节 '
+        + chapterRows.length)) + ' v' + VERSION;
+  }
+
   function render() {
     const now = Date.now();
-    // 有截止时间的按时间升序；无截止时间的排在后面（未完成优先于已完成）。
     const sorted = rows.slice().sort(function (a, b) {
       const an = a.deadline == null ? Infinity : a.deadline;
       const bn = b.deadline == null ? Infinity : b.deadline;
@@ -1741,32 +2121,52 @@
       if (an === Infinity && a.settled !== b.settled) return a.settled ? 1 : -1;
       return 0;
     });
+    const visibleRows = sorted.filter(function (r) {
+      return matchesText(r.course + ' ' + r.work + ' ' + r.kind) && matchesChip(r);
+    });
     const chapters = chapterRows.slice().sort(function (a, b) {
       const ae = a.endMs == null ? Infinity : a.endMs;
       const be = b.endMs == null ? Infinity : b.endMs;
       return ae - be;
     });
-    const noDueCount = sorted.filter(function (r) { return r.deadline == null; }).length;
-    const hot = sorted.filter(function (r) { return r.deadline != null && r.deadline - now < SEVEN_DAYS; }).length;
-    const endedPart = endedRows.length ? ' · 已结束 ' + endedRows.length : '';
-    titleEl.textContent = (minimized
-      ? ('未截止 ' + sorted.length + endedPart + ' · 章节 ' + chapters.length)
-      : ('未截止 ' + sorted.length + ' 项' + endedPart + ' · 未看完章节 '
-        + chapters.length)) + ' v' + VERSION;
-    const seen = {};
-    const courses = [];
-    chapters.forEach(function (r) {
-      if (seen[r.course]) return;
-      seen[r.course] = 1;
-      courses.push(r);
+    const endedSorted = endedRows.slice().sort(function (a, b) {
+      return (b.endTime || 0) - (a.endTime || 0);
+    }).filter(function (r) {
+      return matchesText(r.course + ' ' + r.work + ' ' + r.kind);
     });
+    const unknownSorted = unknownRows.slice().sort(function (a, b) {
+      return String(a.course).localeCompare(String(b.course), 'zh-CN');
+    }).filter(function (r) {
+      return matchesText(r.course + ' ' + r.work + ' ' + r.kind);
+    });
+    const noDueCount = sorted.filter(function (r) { return r.deadline == null; }).length;
+    updateTitle();
+
+    const courseMap = Object.create(null);
+    chapters.forEach(function (r) {
+      if (!matchesText(r.course + ' ' + r.chapter)) return;
+      const key = r.course;
+      if (!courseMap[key]) courseMap[key] = { course: r.course, chapters: 0, pending: 0, endMs: null };
+      const m = courseMap[key];
+      m.chapters += 1;
+      m.pending += Number(r.pending) || 0;
+      if (r.endMs != null && (m.endMs == null || r.endMs < m.endMs)) m.endMs = r.endMs;
+    });
+    const courses = Object.keys(courseMap).map(function (k) { return courseMap[k]; }).sort(function (a, b) {
+      const ae = a.endMs == null ? Infinity : a.endMs;
+      const be = b.endMs == null ? Infinity : b.endMs;
+      return ae - be;
+    });
+
     const html = ['<div class="cx-col"><div class="cx-sec">作业 / 考试'
-      + (noDueCount ? '（无截止 ' + noDueCount + '）' : '') + '</div>'];
-    if (!sorted.length) {
-      html.push('<div class="cx-empty">没有还没截止的</div>');
+      + (noDueCount ? '（无截止 ' + noDueCount + '）' : '')
+      + (isFiltering() ? '（显示 ' + visibleRows.length + '/' + sorted.length + '）' : '')
+      + '</div>'];
+    if (!visibleRows.length) {
+      html.push('<div class="cx-empty">' + (isFiltering() ? '没有匹配的条目' : '没有还没截止的') + '</div>');
     } else {
       html.push('<table class="cx-tasks"><thead><tr><th>课程</th><th>名称</th><th>还剩</th></tr></thead><tbody>');
-      sorted.forEach(function (r) {
+      visibleRows.forEach(function (r) {
         const left = r.deadline == null ? null : r.deadline - now;
         let cls = '';
         if (r.settled) cls = ' class="cx-ok"';
@@ -1774,17 +2174,17 @@
         else if (left < SEVEN_DAYS) cls = ' class="cx-hot"';
         html.push(
           '<tr' + cls + '><td class="cx-name">' + escapeHtml(r.course) + '</td><td class="cx-work"><span class="cx-kind">[' + r.kind + ']</span>'
-          + escapeHtml(r.work) + ' ' + (r.settled ? '已完成' : '未完成') + '</td><td>'
+          + escapeHtml(r.work) + ' ' + (r.settled ? '已完成' : '未完成') + '</td>'
+          + '<td class="cx-remain" data-deadline="' + (r.deadline == null ? '' : r.deadline) + '" data-settled="' + (r.settled ? '1' : '0') + '">'
           + (left == null ? '无截止时间' : formatRemain(left)) + '</td></tr>'
         );
       });
       html.push('</tbody></table>');
     }
-    if (endedRows.length) {
-      const endedSorted = endedRows.slice().sort(function (a, b) {
-        return (b.endTime || 0) - (a.endTime || 0);
-      });
-      html.push('<div class="cx-sec cx-sub">最近30天已结束（未作答）</div>');
+    if (filterMode === 'all' && endedSorted.length) {
+      html.push('<div class="cx-sec cx-sub">最近30天已结束（未作答）'
+        + (isFiltering() ? '（显示 ' + endedSorted.length + '/' + endedRows.length + '）' : '')
+        + '</div>');
       html.push('<table class="cx-ended"><thead><tr><th>课程</th><th>名称</th><th>结束于</th></tr></thead><tbody>');
       endedSorted.forEach(function (r) {
         html.push('<tr class="cx-ended"><td class="cx-name">' + escapeHtml(r.course) + '</td>'
@@ -1795,20 +2195,81 @@
       });
       html.push('</tbody></table>');
     }
+    if (filterMode === 'all' && unknownSorted.length) {
+      html.push('<div class="cx-sec cx-sub cx-toggle" data-act="toggle-unknown" role="button" tabindex="0" aria-expanded="'
+        + (unknownOpen ? 'true' : 'false') + '">已结束但时间未知（' + unknownSorted.length
+        + '）<span class="cx-caret">' + (unknownOpen ? '▾' : '▸') + '</span></div>');
+      if (unknownOpen) {
+        html.push('<table class="cx-ended cx-unknown"><thead><tr><th>课程</th><th>名称</th><th>结束于</th></tr></thead><tbody>');
+        unknownSorted.forEach(function (r) {
+          html.push('<tr class="cx-ended"><td class="cx-name">' + escapeHtml(r.course) + '</td>'
+            + '<td class="cx-work"><span class="cx-kind">[' + r.kind + ']</span>'
+            + escapeHtml(r.work) + ' ' + escapeHtml(r.status || '未交') + '</td>'
+            + '<td>未知<span class="cx-status">详情页也没有读取到结束时间</span></td></tr>');
+        });
+        html.push('</tbody></table>');
+      }
+    }
     html.push('</div><div class="cx-col"><div class="cx-sec">未看完课程</div>');
     if (!courses.length) {
-      html.push('<div class="cx-empty">没有未看完的课</div>');
+      html.push('<div class="cx-empty">' + (isFiltering() ? '没有匹配的课程' : '没有未看完的课') + '</div>');
     } else {
-      html.push('<table class="cx-chapters"><thead><tr><th>课程名称</th><th>课程还剩</th></tr></thead><tbody>');
-      courses.forEach(function (r) {
-        const leftText = r.endMs == null ? '未显示结课时间' : formatRemain(r.endMs - now);
-        html.push('<tr><td class="cx-name">' + escapeHtml(r.course) + '</td><td>' + leftText + '</td></tr>');
+      html.push('<table class="cx-chapters"><thead><tr><th>课程名称</th><th>未完成章节</th><th>课程还剩</th></tr></thead><tbody>');
+      courses.forEach(function (m) {
+        const leftText = m.endMs == null ? '未显示结课时间' : formatRemain(m.endMs - now);
+        html.push('<tr><td class="cx-name">' + escapeHtml(m.course) + '</td>'
+          + '<td>' + m.chapters + ' 个<span class="cx-status">共 ' + m.pending + ' 个任务点</span></td>'
+          + '<td class="cx-course-left" data-endms="' + (m.endMs == null ? '' : m.endMs) + '">' + leftText + '</td></tr>');
       });
       html.push('</tbody></table>');
     }
     html.push('</div>');
+
+    const oldCols = bodyEl.querySelectorAll('.cx-col');
+    const oldScroll = Array.prototype.map.call(oldCols, function (c) { return c.scrollTop; });
+    progressFill = null;
+    progressText = null;
     bodyEl.innerHTML = html.join('');
+    const newCols = bodyEl.querySelectorAll('.cx-col');
+    for (let i = 0; i < newCols.length && i < oldScroll.length; i++) {
+      if (oldScroll[i]) newCols[i].scrollTop = oldScroll[i];
+    }
+    updateTools();
   }
+
+  // 30 秒只在原位刷新倒计时，不重建 DOM —— 滚动位置和文本选中都不会丢。
+  function refreshTimers() {
+    const now = Date.now();
+    bodyEl.querySelectorAll('td.cx-remain[data-deadline]').forEach(function (td) {
+      const deadline = Number(td.getAttribute('data-deadline'));
+      if (!deadline) return;
+      const settled = td.getAttribute('data-settled') === '1';
+      const left = deadline - now;
+      td.textContent = formatRemain(left);
+      const tr = td.parentElement;
+      if (tr) tr.className = settled ? 'cx-ok' : (left < SEVEN_DAYS ? 'cx-hot' : '');
+    });
+    bodyEl.querySelectorAll('td.cx-course-left[data-endms]').forEach(function (td) {
+      const endMs = Number(td.getAttribute('data-endms'));
+      if (endMs) td.textContent = formatRemain(endMs - now);
+    });
+    if (lastScanTs) lastEl.textContent = '上次扫描 ' + formatClock(lastScanTs);
+  }
+
+  bodyEl.addEventListener('click', function (e) {
+    const head = e.target && e.target.closest ? e.target.closest('[data-act="toggle-unknown"]') : null;
+    if (!head) return;
+    unknownOpen = !unknownOpen;
+    render();
+  });
+  bodyEl.addEventListener('keydown', function (e) {
+    if (e.key !== 'Enter' && e.key !== ' ') return;
+    const head = e.target && e.target.closest ? e.target.closest('[data-act="toggle-unknown"]') : null;
+    if (!head) return;
+    e.preventDefault();
+    unknownOpen = !unknownOpen;
+    render();
+  });
 
   async function mapPool(items, limit, worker) {
     const ret = new Array(items.length);
@@ -1824,6 +2285,70 @@
     for (let i = 0; i < n; i++) jobs.push(run());
     await Promise.all(jobs);
     return ret;
+  }
+
+  function snapshotRow(r) {
+    return {
+      course: r.course,
+      work: r.work,
+      kind: r.kind,
+      status: r.status || '',
+      settled: !!r.settled,
+      deadline: r.deadline == null ? null : r.deadline,
+      noDue: !!r.noDue,
+      ended: !!r.ended,
+      endTime: r.endTime == null ? null : r.endTime
+    };
+  }
+
+  function saveLastScan(ts) {
+    gmSet(STORE_LAST_SCAN, {
+      v: 1,
+      ts: ts,
+      version: VERSION,
+      failed: failedCourses.slice(),
+      rows: rows.map(snapshotRow),
+      ended: endedRows.map(snapshotRow),
+      unknown: unknownRows.map(snapshotRow),
+      chapters: chapterRows.map(function (r) {
+        return { course: r.course, chapter: r.chapter, pending: r.pending, endMs: r.endMs == null ? null : r.endMs };
+      })
+    });
+  }
+
+  function restoreLastScan() {
+    const snap = gmGet(STORE_LAST_SCAN, null);
+    if (!snap || typeof snap !== 'object' || snap.v !== 1 || !snap.ts) return false;
+    const age = Date.now() - snap.ts;
+    if (!(age >= 0 && age < 14 * 86400000)) return false;
+    rows = Array.isArray(snap.rows) ? snap.rows : [];
+    endedRows = Array.isArray(snap.ended) ? snap.ended : [];
+    unknownRows = Array.isArray(snap.unknown) ? snap.unknown : [];
+    chapterRows = Array.isArray(snap.chapters) ? snap.chapters : [];
+    failedCourses = Array.isArray(snap.failed) ? snap.failed : [];
+    lastScanTs = snap.ts;
+    return true;
+  }
+
+  function scheduleSnapshotSave() {
+    clearTimeout(snapshotTimer);
+    snapshotTimer = setTimeout(function () {
+      if (lastScanTs && !loading) saveLastScan(lastScanTs);
+    }, 1200);
+  }
+
+  function updateFailureUI() {
+    if (failedCourses.length) {
+      const preview = failedCourses.slice(0, 3).join('、');
+      alertEl.hidden = false;
+      alertEl.textContent = '有 ' + failedCourses.length + ' 门课未读全：' + preview
+        + (failedCourses.length > 3 ? ' 等' : '') + '。点此查看日志';
+      alertEl.title = failedCourses.join('、');
+    } else {
+      alertEl.hidden = true;
+      alertEl.textContent = '';
+      alertEl.title = '查看失败详情';
+    }
   }
 
   // 扫描结束后的后台确认：已完成/待批阅且列表没给时间的作业才需要读详情。
@@ -1862,6 +2387,7 @@
       if (added) {
         render();
         log('后台确认新增 ' + added + ' 条已完成/待批阅作业（无截止时间或还未到期）');
+        scheduleSnapshotSave();
       }
     }
 
@@ -1893,164 +2419,243 @@
 
   let scanGen = 0;
 
+  function cancelScan() {
+    if (!loading) return;
+    scanGen += 1;
+    loading = false;
+    setScanBtn(hasResults() || lastScanTs ? '↻ 重新扫描' : '▶ 扫描', false);
+    scanBtn.title = '重新扫描当前页面可见课程';
+    hintEl.hidden = true;
+    log('扫描已取消（已发出的请求会自行结束，结果不再采用）');
+    if (hasResults()) {
+      render();
+      updateFailureUI();
+      footEl.textContent = '已取消本次扫描，显示上次结果。';
+    } else {
+      renderIdle();
+      footEl.textContent = '拖动蓝条移动，拖动边框调整大小';
+    }
+    flashToast('扫描已取消');
+  }
+
   async function scan() {
     const gen = ++scanGen;
     loading = true;
-    const courses = coursesFromPage();
-    if (!courses.length) {
-      rows = [];
-      endedRows = [];
-      chapterRows = [];
-      titleEl.textContent = '没有课程';
-      bodyEl.innerHTML = '<div class="cx-empty">当前筛选下没有课程</div>';
-      footEl.textContent = '';
-      loading = false;
-      setScanBtn('▶ 扫描', false);
-      return;
-    }
-    const errors = [];
-    const retryList = [];
-    let done = 0;
-    const t0 = Date.now();
-    // 每轮扫描重新开始：之前被反爬弃用的域名可以再试一次
-    resetBans();
-    resetHits();
-    log('===== 开始扫描，共 ' + courses.length + ' 门课，脚本 v' + VERSION + ' =====');
-    log('页面地址: ' + location.href);
-    log('识别到的课程数: ' + courses.length);
-    // 卡片链接落在哪个域名，直接决定了会不会撞上 mooc1 的反爬，必须打出来
-    const hostCount = {};
-    courses.forEach(function (c) {
-      const h = hostOf(c.href) || '(无链接)';
-      hostCount[h] = (hostCount[h] || 0) + 1;
-    });
-    log('卡片链接域名分布: ' + Object.keys(hostCount).map(function (k) {
-      return k + '×' + hostCount[k];
-    }).join('  '));
-    if (courses.length) {
+    try {
+      const courses = coursesFromPage();
+      if (!courses.length) {
+        rows = [];
+        endedRows = [];
+        unknownRows = [];
+        chapterRows = [];
+        failedCourses = [];
+        scannedKeys = '';
+        lastScanTs = Date.now();
+        saveLastScan(lastScanTs);
+        titleEl.textContent = '没有课程';
+        bodyEl.innerHTML = '<div class="cx-empty">当前筛选下没有课程<br>请确认在课程列表页并选了正确的学期</div>';
+        footEl.textContent = '';
+        updateFailureUI();
+        updateTools();
+        log('扫描：当前筛选下没有课程');
+        return;
+      }
+      scannedKeys = courses.map(function (c) { return c.courseId + ':' + c.classId; }).sort().join('|');
+      const retryList = [];
+      let done = 0;
+      const t0 = Date.now();
+      // 每轮扫描重新开始：之前被反爬弃用的域名和入口都可以再试一次
+      resetBans();
+      resetHits();
+      resetBadEntry();
+      log('===== 开始扫描，共 ' + courses.length + ' 门课，脚本 v' + VERSION + ' =====');
+      log('页面地址: ' + location.href);
+      log('识别到的课程数: ' + courses.length);
+      // 卡片链接落在哪个域名，直接决定了会不会撞上 mooc1 的反爬，必须打出来
+      const hostCount = {};
+      courses.forEach(function (c) {
+        const h = hostOf(c.href) || '(无链接)';
+        hostCount[h] = (hostCount[h] || 0) + 1;
+      });
+      log('卡片链接域名分布: ' + Object.keys(hostCount).map(function (k) {
+        return k + '×' + hostCount[k];
+      }).join('  '));
       log('入口顺序示例[' + courses[0].name + ']: ' + portalCandidates(courses[0], 0).map(function (c, i) {
         return (i + 1) + '.' + c.family + '=' + String(c.url).slice(0, 95);
       }).join('  |  '));
-    }
-    if (!courses.length) probePage();
-    titleEl.textContent = '正在读取 0/' + courses.length;
-    bodyEl.innerHTML = '<div class="cx-empty">正在逐门读取作业、考试和章节…</div>';
-    footEl.textContent = '左：7天内未完成标红，已完成或待批改且还有剩余时间标绿，最近30天已结束单列。右：未看完课程';
-    // 结果按课程存，重试时覆盖（而不是追加），避免同一门课的数据重复计入
-    const results = {};
-    const keyOf = function (c) { return c.courseId + ':' + c.classId; };
-    await mapPool(courses, CONCURRENCY_FAST, async function (course, i) {
-      if (gen !== scanGen) return;
-      try {
-        const pack = await loadCourse(course, i);
+      hintEl.hidden = true;
+      alertEl.hidden = true;
+      showProgress(courses.length);
+      footEl.textContent = '左：7天内未完成标红，已完成或待批改且还有剩余时间标绿，已结束作业单列。右：未看完课程';
+      // 结果按课程存，重试时覆盖（而不是追加），避免同一门课的数据重复计入
+      const results = {};
+      const keyOf = function (c) { return c.courseId + ':' + c.classId; };
+      await mapPool(courses, CONCURRENCY_FAST, async function (course, i) {
         if (gen !== scanGen) return;
-        results[keyOf(course)] = pack;
-        if (pack.failed.length) retryList.push(course);
-        log('[' + course.name + '] 完成：作业/考试 '
-          + ((pack.work ? pack.work.length : 0) + (pack.exam ? pack.exam.length : 0))
-          + ' 条，未完成章节 ' + (pack.chapter ? pack.chapter.length : 0)
-          + ' 个' + (pack.failed.length ? '（' + pack.failed.join('/') + ' 待重试）' : ''));
-      } catch (err) {
-        const msg = err && err.message ? err.message : '失败';
-        errors.push(course.name + '：' + msg);
-        results[keyOf(course)] = { work: null, workEnded: null, exam: null, chapter: null, failed: ['portal'], portal: null, noData: false, pendingSettled: [] };
-        retryList.push(course);
-        log('[' + course.name + '] 失败：' + msg);
-      }
-      done += 1;
-      if (gen === scanGen) titleEl.textContent = '正在读取 ' + done + '/' + courses.length;
-    });
-    // 第一轮没读全的门课，等一会儿再重试一次。
-    // 只补失败的那一项（复用已拿到的门户参数），不用把整门课重取一遍。
-    if (retryList.length && gen === scanGen) {
-      log('===== 有 ' + retryList.length + ' 门没读全，等 4 秒后重试一轮 =====');
-      titleEl.textContent = '正在重试 ' + retryList.length + ' 门';
-      await sleep(4000);
-      // 重试前把弃用名单清掉：上一轮被拦的域名，过几秒可能已经放行
-      resetBans();
-      await mapPool(retryList, 2, async function (course, i) {
-        if (gen !== scanGen) return;
-        const prev = results[keyOf(course)] || {};
         try {
-          const pack = await loadCourse(course, i + 500, {
-            portal: prev.portal,
-            workOk: prev.failed.indexOf('work') < 0,
-            examOk: prev.failed.indexOf('exam') < 0,
-            chapterOk: prev.failed.indexOf('chapter') < 0
-          });
+          const pack = await loadCourse(course, i);
           if (gen !== scanGen) return;
-          // 只用重试补上的部分覆盖，其它部分保留第一轮的结果。
-          // 注意：第一轮若是「门户就失败」，prev.failed 里只有 'portal'，三个数据项都不在，
-          // 这时必须整体采用重试结果，否则第一轮拿到的 null 会把重试补回的数据覆盖掉。
-          const portalFailed = !prev.portal;
-          const want = function (k) { return portalFailed || prev.failed.indexOf(k) >= 0; };
-          results[keyOf(course)] = {
-            work: want('work') ? pack.work : prev.work,
-            workEnded: want('work') ? pack.workEnded : prev.workEnded,
-            exam: want('exam') ? pack.exam : prev.exam,
-            chapter: want('chapter') ? pack.chapter : prev.chapter,
-            failed: pack.failed,
-            noData: !!(prev.noData || pack.noData),
-            portal: pack.portal || prev.portal,
-            pendingSettled: want('work') ? pack.pendingSettled : prev.pendingSettled
-          };
-          const r = results[keyOf(course)];
-          log('[' + course.name + '] 重试完成：作业/考试 '
-            + ((r.work ? r.work.length : 0) + (r.exam ? r.exam.length : 0))
-            + ' 条，未完成章节 ' + (r.chapter ? r.chapter.length : 0)
-            + ' 个' + (r.failed.length ? '（仍失败：' + r.failed.join('/') + '）' : ''));
+          results[keyOf(course)] = pack;
+          if (pack.failed.length) retryList.push(course);
+          log('[' + course.name + '] 完成：作业/考试 '
+            + ((pack.work ? pack.work.length : 0) + (pack.exam ? pack.exam.length : 0))
+            + ' 条，未完成章节 ' + (pack.chapter ? pack.chapter.length : 0)
+            + ' 个' + (pack.failed.length ? '（' + pack.failed.join('/') + ' 待重试）' : ''));
         } catch (err) {
-          log('[' + course.name + '] 重试仍失败：' + (err && err.message ? err.message : '失败'));
+          const msg = err && err.message ? err.message : '失败';
+          results[keyOf(course)] = { work: null, workEnded: null, workUnknown: null, exam: null, chapter: null, failed: ['portal'], portal: null, noData: false, pendingSettled: [] };
+          retryList.push(course);
+          log('[' + course.name + '] 失败：' + msg);
+        }
+        done += 1;
+        if (gen === scanGen) updateProgress(done, courses.length, course.name);
+      });
+      // 第一轮没读全的课，等一会儿再重试一次。
+      // 只补失败的那一项（复用已拿到的门户参数），不用把整门课重取一遍。
+      if (retryList.length && gen === scanGen) {
+        log('===== 有 ' + retryList.length + ' 门没读全，等 4 秒后重试一轮 =====');
+        titleEl.textContent = '正在重试 ' + retryList.length + ' 门';
+        if (progressFill) progressFill.style.width = '100%';
+        if (progressText) progressText.textContent = '首轮完成，正在重试 ' + retryList.length + ' 门…';
+        await sleep(4000);
+        if (gen !== scanGen) return;
+        // 重试前把弃用名单清掉：上一轮被拦的域名，过几秒可能已经放行
+        resetBans();
+        let retryDone = 0;
+        await mapPool(retryList, 2, async function (course, i) {
+          if (gen !== scanGen) return;
+          const prev = results[keyOf(course)] || {};
+          const prevFailed = prev.failed || [];
+          try {
+            const pack = await loadCourse(course, i + 500, {
+              portal: prev.portal,
+              workOk: prevFailed.indexOf('work') < 0,
+              examOk: prevFailed.indexOf('exam') < 0,
+              chapterOk: prevFailed.indexOf('chapter') < 0
+            });
+            if (gen !== scanGen) return;
+            // 只用重试补上的部分覆盖，其它部分保留第一轮的结果。
+            // 注意：第一轮若是「门户就失败」，prev.failed 里只有 'portal'，三个数据项都不在，
+            // 这时必须整体采用重试结果，否则第一轮拿到的 null 会把重试补回的数据覆盖掉。
+            const portalFailed = !prev.portal;
+            const want = function (k) { return portalFailed || prevFailed.indexOf(k) >= 0; };
+            results[keyOf(course)] = {
+              work: want('work') ? pack.work : prev.work,
+              workEnded: want('work') ? pack.workEnded : prev.workEnded,
+              workUnknown: want('work') ? pack.workUnknown : prev.workUnknown,
+              exam: want('exam') ? pack.exam : prev.exam,
+              chapter: want('chapter') ? pack.chapter : prev.chapter,
+              failed: pack.failed,
+              noData: !!(prev.noData || pack.noData),
+              portal: pack.portal || prev.portal,
+              pendingSettled: want('work') ? pack.pendingSettled : prev.pendingSettled
+            };
+            const r = results[keyOf(course)];
+            log('[' + course.name + '] 重试完成：作业/考试 '
+              + ((r.work ? r.work.length : 0) + (r.exam ? r.exam.length : 0))
+              + ' 条，未完成章节 ' + (r.chapter ? r.chapter.length : 0)
+              + ' 个' + (r.failed.length ? '（仍失败：' + r.failed.join('/') + '）' : ''));
+          } catch (err) {
+            log('[' + course.name + '] 重试仍失败：' + (err && err.message ? err.message : '失败'));
+          }
+          retryDone += 1;
+          if (gen === scanGen) {
+            if (progressText) progressText.textContent = '正在重试 ' + retryDone + '/' + retryList.length
+              + ' · 刚完成：' + course.name;
+            titleEl.textContent = '正在重试 ' + retryDone + '/' + retryList.length;
+          }
+        });
+      }
+      if (gen !== scanGen) return;
+      // 汇总：每门课只贡献一次
+      const nextRows = [];
+      const nextEnded = [];
+      const nextUnknown = [];
+      const nextChapters = [];
+      const nextSettled = [];
+      const failedNames = [];
+      let noDataCount = 0;
+      let partialCount = 0;
+      let portalFailCount = 0;
+      courses.forEach(function (c) {
+        const r = results[keyOf(c)];
+        if (!r) {
+          portalFailCount += 1;
+          failedNames.push(c.name);
+          return;
+        }
+        if (r.work) nextRows.push.apply(nextRows, r.work);
+        if (r.workEnded) nextEnded.push.apply(nextEnded, r.workEnded);
+        if (r.workUnknown) nextUnknown.push.apply(nextUnknown, r.workUnknown);
+        if (r.exam) nextRows.push.apply(nextRows, r.exam);
+        if (r.chapter) nextChapters.push.apply(nextChapters, r.chapter);
+        if (r.pendingSettled) nextSettled.push.apply(nextSettled, r.pendingSettled);
+        // 「没有数据」和「读取失败」是两回事，汇总里必须分开报
+        if (r.noData) noDataCount += 1;
+        if (!r.portal) {
+          portalFailCount += 1;
+          failedNames.push(c.name);
+        } else if (r.failed && r.failed.length) {
+          partialCount += 1;
+          failedNames.push(c.name);
         }
       });
+      failedCourses = failedNames.filter(function (name, i) { return failedNames.indexOf(name) === i; });
+      rows = nextRows;
+      endedRows = nextEnded;
+      unknownRows = nextUnknown;
+      chapterRows = nextChapters;
+      lastScanTs = Date.now();
+      saveLastScan(lastScanTs);
+      render();
+      updateFailureUI();
+      const secs = ((Date.now() - t0) / 1000).toFixed(1);
+      const noDueCount = nextRows.filter(function (r) { return r.deadline == null; }).length;
+      log('===== 扫描结束：作业/考试 ' + nextRows.length + ' 条'
+        + (noDueCount ? '（其中无截止时间 ' + noDueCount + ' 条）' : '')
+        + '，最近30天已结束未作答 ' + nextEnded.length + ' 条，已结束但时间未知 '
+        + nextUnknown.length + ' 条，未完成章节 ' + nextChapters.length
+        + ' 个，无数据 ' + noDataCount + ' 门，部分失败 ' + partialCount
+        + ' 门，入口失败 ' + portalFailCount + ' 门，未读全 ' + failedCourses.length
+        + ' 门，用时 ' + secs + ' 秒（v' + VERSION + '，' + courses.length + ' 门课） =====');
+      log('请求分布（共 ' + totalHits + ' 次）：' + (Object.keys(hostHits).sort(function (a, b) {
+        return hostHits[b] - hostHits[a];
+      }).map(function (k) {
+        return k.replace('.chaoxing.com', '') + '=' + hostHits[k];
+      }).join(' ') || '无')
+        + ' | GM 内部跳转落点：' + (Object.keys(landHits).map(function (k) {
+          return k.replace('.chaoxing.com', '') + '=' + landHits[k];
+        }).join(' ') || '无'));
+      footEl.textContent = failedCourses.length
+        ? ('有 ' + failedCourses.length + ' 门课未读全，点上方提示或 ☰ 查看日志')
+        : '拖动蓝条移动、拖边框调整大小。7天内未完成标红，无截止时间标橙，已完成/待批阅标绿，已结束作业单列。';
+      flashToast('扫描完成：作业/考试 ' + nextRows.length + ' 条，用时 ' + secs + ' 秒');
+      // 后台补查不 await：结果已经渲染完，确认出来的「无截止/未到期」作业会陆续补进列表。
+      confirmSettledRows(nextSettled, gen).catch(function (e) {
+        log('后台确认异常：' + (e && e.message ? e.message : '失败'));
+      });
+    } catch (err) {
+      if (gen === scanGen) {
+        const msg = err && err.message ? err.message : '失败';
+        log('扫描异常终止：' + msg);
+        flashToast('扫描失败：' + msg);
+        if (hasResults()) {
+          render();
+          updateFailureUI();
+          footEl.textContent = '本次扫描异常终止，显示上次结果。点 ☰ 查看日志。';
+        } else {
+          titleEl.textContent = '扫描失败';
+          bodyEl.innerHTML = '<div class="cx-empty">扫描失败：' + escapeHtml(msg) + '<br>点顶部「↻ 重新扫描」重试</div>';
+          footEl.textContent = '点 ☰ 查看详细日志';
+        }
+      }
+    } finally {
+      if (gen === scanGen) {
+        loading = false;
+        setScanBtn(hasResults() || lastScanTs ? '↻ 重新扫描' : '▶ 扫描', false);
+        scanBtn.title = '重新扫描当前页面可见课程';
+      }
     }
-    if (gen !== scanGen) return;
-    // 汇总：每门课只贡献一次
-    const nextRows = [];
-    const nextEnded = [];
-    const nextChapters = [];
-    const nextSettled = [];
-    let noDataCount = 0;
-    let partialCount = 0;
-    courses.forEach(function (c) {
-      const r = results[keyOf(c)];
-      if (!r) return;
-      if (r.work) nextRows.push.apply(nextRows, r.work);
-      if (r.workEnded) nextEnded.push.apply(nextEnded, r.workEnded);
-      if (r.exam) nextRows.push.apply(nextRows, r.exam);
-      if (r.chapter) nextChapters.push.apply(nextChapters, r.chapter);
-      if (r.pendingSettled) nextSettled.push.apply(nextSettled, r.pendingSettled);
-      // 「没有数据」和「读取失败」是两回事，汇总里必须分开报
-      if (r.noData) noDataCount += 1;
-      if (r.failed && r.failed.length) partialCount += 1;
-    });
-    rows = nextRows;
-    endedRows = nextEnded;
-    chapterRows = nextChapters;
-    loading = false;
-    setScanBtn('↻ 重新扫描', false);
-    render();
-    const secs = ((Date.now() - t0) / 1000).toFixed(1);
-    const noDueCount = nextRows.filter(function (r) { return r.deadline == null; }).length;
-    log('===== 扫描结束：作业/考试 ' + nextRows.length + ' 条'
-      + (noDueCount ? '（其中无截止时间 ' + noDueCount + ' 条）' : '')
-      + '，最近30天已结束未作答 ' + nextEnded.length + ' 条，未完成章节 '
-      + nextChapters.length + ' 个，无数据 ' + noDataCount + ' 门，部分失败 ' + partialCount
-      + ' 门，读取失败 ' + errors.length + ' 门，用时 ' + secs
-      + ' 秒（v' + VERSION + '，' + courses.length + ' 门课） =====');
-    log('请求分布（共 ' + totalHits + ' 次）：' + (Object.keys(hostHits).sort(function (a, b) {
-      return hostHits[b] - hostHits[a];
-    }).map(function (k) {
-      return k.replace('.chaoxing.com', '') + '=' + hostHits[k];
-    }).join(' ') || '无')
-      + ' | GM 内部跳转落点：' + (Object.keys(landHits).map(function (k) {
-        return k.replace('.chaoxing.com', '') + '=' + landHits[k];
-      }).join(' ') || '无'));
-    footEl.textContent = errors.length
-      ? ('有 ' + errors.length + ' 门没读全，点 ☰ 看详细日志')
-      : '拖动蓝条移动、拖边框调整大小。7天内未完成标红，无截止时间标橙，已完成/待批阅标绿，最近30天已结束单列。';
-    // 后台补查不 await：结果已经渲染完，确认出来的「无截止/未到期」作业会陆续补进列表。
-    confirmSettledRows(nextSettled, gen);
   }
 
   /* =====================================================================
@@ -2113,6 +2718,13 @@
 
   function hideUpdateToast() {
     if (updateToastHost) updateToastHost.style.display = 'none';
+  }
+
+  let flashToastTimer = 0;
+  function flashToast(message, ms) {
+    showUpdateToast(message);
+    clearTimeout(flashToastTimer);
+    flashToastTimer = setTimeout(hideUpdateToast, ms || 2800);
   }
 
   function cmpVersion(a, b) {
@@ -2292,13 +2904,33 @@
   }
 
   setInterval(function () {
-    if (!loading && (rows.length || endedRows.length || chapterRows.length)) render();
+    if (!loading && (rows.length || endedRows.length || unknownRows.length || chapterRows.length)) refreshTimers();
   }, 30000);
+
+  // 学期/筛选变化只做本地提示，不发请求（8 秒兜底 + DOM 变化去抖）。
+  setInterval(function () {
+    if (!loading && lastScanTs) scheduleHintCheck();
+  }, 8000);
+  try {
+    new MutationObserver(scheduleHintCheck).observe(document.body, { childList: true, subtree: true });
+  } catch (e) { /* ignore */ }
 
   // v2.5.0：不再自动扫描。
   // 以前是「页面一加载 + DOM 一变化 + 切学期筛选」就自动跑，刷新一次就白扫一遍，
   // 还会在用户没要求的时候先打出去几十个请求。现在改成纯手动：点「▶ 扫描」才发请求。
   registerUpdateMenu();
+  restorePanelState();
   log('脚本 v' + VERSION + ' 已就绪（' + location.host + '），点「▶ 扫描」开始读取；不会自动读取');
-  renderIdle();
+  if (restoreLastScan()) {
+    scannedKeys = currentCourseKeys();
+    log('已恢复上次扫描结果（' + formatClock(lastScanTs) + '），点「↻ 重新扫描」可重新读取');
+    if (failedCourses.length) log('上次扫描未读全的课程：' + failedCourses.join('、'));
+    render();
+    updateFailureUI();
+    footEl.textContent = failedCourses.length
+      ? ('上次结果中有 ' + failedCourses.length + ' 门课未读全，点上方提示或 ☰ 查看日志')
+      : '这是上次扫描的结果，点「↻ 重新扫描」更新。';
+  } else {
+    renderIdle();
+  }
 })();
