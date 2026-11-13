@@ -1,8 +1,9 @@
 // ==UserScript==
 // @name         超星通用课程截止提醒
 // @namespace    chaoxing-deadline
-// @version      2.9.0
+// @version      2.9.1
 // @description  通用课程（含新版）和课程都读取：列出还没截止的作业和考试（含未设置截止时间的），单列最近30天已结束且未作答的作业，另列出未结课且章节没看完的课程；菜单一键更新
+// @author       specdock
 // @match        https://mooc1-2.chaoxing.com/visit/courses*
 // @match        https://mooc1-2.chaoxing.com/mooc-ans/visit/courses*
 // @match        https://mooc1.chaoxing.com/visit/courses*
@@ -254,7 +255,7 @@
   const minBtn = panel.querySelector('[data-act="min"]');
   const logBtn = panel.querySelector('[data-act="log"]');
   const scanBtn = panel.querySelector('[data-act="scan"]');
-  const FALLBACK_VERSION = '2.9.0';
+  const FALLBACK_VERSION = '2.9.1';
   const VERSION = (function () {
     try {
       if (typeof GM_info !== 'undefined' && GM_info && GM_info.script && GM_info.script.version) {

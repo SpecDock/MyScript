@@ -1,9 +1,9 @@
 // ==UserScript==
 // @name         学堂在线自动刷课 + AI 自动做题
 // @namespace    https://www.xuetangx.com/
-// @version      1.8.0
+// @version      1.8.1
 // @description  通用版：自动刷视频进度（真静音、暂停自动续播）；进到章节作业后自动提取题目、请求 AI、选择答案并真实提交，提交后页面自动切到下一题（支持单选 / 多选 / 判断题）。腾讯点选文字验证码自动识别（需支持视觉的模型）。以当前所在页面为准，换任何一门课都能直接用；菜单一键更新。
-// @author       local
+// @author       specdock
 // @match        https://www.xuetangx.com/*
 // @match        https://turing.captcha.gtimg.com/*
 // @match        https://turing.captcha.qcloud.com/*
@@ -86,7 +86,7 @@ const CONFIG = {
  * 油猴原生更新仍由 @updateURL / @downloadURL 负责；
  * 菜单检查只做「本地版本 vs GitHub 远程版本」的比较，有新版就打开安装页。
  * ------------------------------------------------------------------------- */
-const FALLBACK_VERSION = "1.8.0";
+const FALLBACK_VERSION = "1.8.1";
 const SCRIPT_VERSION = (() => {
   try {
     if (typeof GM_info !== "undefined" && GM_info && GM_info.script && GM_info.script.version) {
