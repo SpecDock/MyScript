@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Selection Translator
 // @namespace    specdock.my-script.selection-translator
-// @version      1.5.1
+// @version      1.5.2
 // @description  静默划词翻译：中文→英文，其他→中文。Google / 微软 / 腾讯 → 火山 / 有道 / 彩云 → MyMemory 分批并发回退，LLM 兜底；可视化设置面板；菜单一键更新。
 // @author       specdock
 // @match        *://*/*
@@ -35,7 +35,7 @@
 
   const SCRIPT_NAME = 'Selection Translator';
   const SCRIPT_NS = 'specdock.my-script.selection-translator';
-  const FALLBACK_VERSION = '1.5.1';
+  const FALLBACK_VERSION = '1.5.2';
   const SCRIPT_VERSION = (() => {
     try {
       return (typeof GM_info !== 'undefined' && GM_info.script && GM_info.script.version) || FALLBACK_VERSION;
@@ -1820,25 +1820,7 @@
     isMouseSelecting = false;
   }
 
-  /* ================= 10. 预热与菜单 ================= */
-
-  function warmupEngines() {
-    if (!IS_TOP) return;
-    const idle = window.requestIdleCallback
-      ? (fn => window.requestIdleCallback(fn, { timeout: 4000 }))
-      : (fn => setTimeout(fn, 1200));
-    idle(() => {
-      if (!(downUntil.ms > Date.now())) {
-        getMsToken()
-          .then(() => msTranslate('hi', 'zh'))
-          .then(() => markUp('ms'))
-          .catch(() => markDown('ms'));
-      }
-      if (!(downUntil.tencent > Date.now())) {
-        tencentTranslate('hello', 'zh').then(() => markUp('tencent')).catch(() => markDown('tencent'));
-      }
-    });
-  }
+  /* ================= 10. 菜单 ================= */
 
   function resetLlmFailure() {
     markUp('llm');
@@ -1872,7 +1854,6 @@
     window.addEventListener('blur', onWindowBlur, true);
     window.addEventListener('pointerup', onPointerUp, true);
     document.addEventListener('selectionchange', onSelectionChange);
-    warmupEngines();
   }
 
   if (document.readyState === 'loading') {
