@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         超星课件抓取器 · PPT/PDF/页面图片 合并导出
 // @namespace    specdock.my-script.chaoxing-courseware
-// @version      1.0.0
+// @version      1.0.1
 // @description  在超星学习通（兼容学堂在线）课程页扫描各章节里的 PPT / PDF / 幻灯片，逐页抓取后合并成一个文件，按章节名保存到本地；学习通下可把当前页面正文里的图片收成一份高清 PDF。面板可拖动，菜单一键更新。
 // @author       specdock
 // @match        https://mooc1.chaoxing.com/mycourse/*
@@ -1832,7 +1832,7 @@
   // =====================================================================
   const SCRIPT_NAME = "超星课件抓取器 · PPT/PDF/页面图片 合并导出";
   const SCRIPT_NS = "specdock.my-script.chaoxing-courseware";
-  const FALLBACK_VERSION = "1.0.0";
+  const FALLBACK_VERSION = "1.0.1";
   const SCRIPT_VERSION = (() => {
     try {
       return (typeof GM_info !== "undefined" && GM_info.script && GM_info.script.version) || FALLBACK_VERSION;
@@ -2126,7 +2126,7 @@
   }
 
   if (typeof module !== "undefined" && module.exports) {
-    module.exports = { safeName, extOf, isImg, isDoc, resolveUrl, scanJson, collectLeafIds, groupNameOf, randomName, sniffBytes, buildLeafLabels, attachAttname, SITE, cxParseChapters, cxParseAttachments, cxResolveUrl, ctxOk, buildUrl };
+    module.exports = { safeName, extOf, isImg, isDoc, resolveUrl, scanJson, collectLeafIds, groupNameOf, randomName, sniffBytes, buildLeafLabels, attachAttname, SITE, cxParseChapters, cxParseAttachments, cxResolveUrl, cxHiResUrl, ctxOk, buildUrl, cmpVersion, parseMeta, isSameScript, UPDATE };
   } else if (document.readyState === "loading") {
     document.addEventListener("DOMContentLoaded", boot);
   } else {
