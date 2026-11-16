@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         超星课件抓取器 · PPT/PDF/页面图片 合并导出
 // @namespace    specdock.my-script.chaoxing-courseware
-// @version      1.0.1
+// @version      1.1.0
 // @description  在超星学习通（兼容学堂在线）课程页扫描各章节里的 PPT / PDF / 幻灯片，逐页抓取后合并成一个文件，按章节名保存到本地；学习通下可把当前页面正文里的图片收成一份高清 PDF。面板可拖动，菜单一键更新。
 // @author       specdock
 // @match        https://mooc1.chaoxing.com/mycourse/*
@@ -87,9 +87,13 @@
     libs: { "pdf-lib": null, pptxgenjs: null },
     libTried: {},
     ctx: null,
-    groups: [],          // {chapter, items:[{url,kind,name,pages:[]}], selected}
+    groups: [],              // {chapter, items:[{url,kind,name,pages:[]}]}
+    selected: new Set(),     // 当前勾选的 group 下标
     running: false,
-    warnedPerm: false,   // 跨源授权框只提醒一次
+    cancelRequested: false,
+    scanned: false,
+    canScan: true,
+    warnedPerm: false,       // 跨源授权框只提醒一次
   };
 
   // 调试钩子：在页面控制台里可以看 window.__XTD_STATE.groups 里的真实资源地址
@@ -109,6 +113,13 @@
     if (!s) return fallback;
     if (/^(con|prn|aux|nul|com[1-9]|lpt[1-9])$/i.test(s)) s = "_" + s;
     return s.slice(0, 120);
+  }
+
+  /** 站点标题来自远端 HTML/JSON，插入面板前必须转义 */
+  function escapeHtml(raw) {
+    return String(raw == null ? "" : raw).replace(/[&<>"']/g, (c) => ({
+      "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;",
+    }[c]));
   }
 
   function extOf(url) {
@@ -545,13 +556,14 @@
     }));
   }
 
-  function bytesToDataUrl(bytes, mime) {
-    let bin = "";
-    const chunk = 0x8000;
-    for (let i = 0; i < bytes.length; i += chunk) {
-      bin += String.fromCharCode.apply(null, bytes.subarray(i, i + chunk));
-    }
-    return `data:${mime};base64,${btoa(bin)}`;
+  /** 只在真的要生成 PPTX 时才转 data URL，避免整批图片常驻一份 Base64 副本 */
+  function blobToDataUrl(blob) {
+    return new Promise((res, rej) => {
+      const fr = new FileReader();
+      fr.onload = () => res(String(fr.result || ""));
+      fr.onerror = () => rej(fr.error || new Error("读取图片失败"));
+      fr.readAsDataURL(blob);
+    });
   }
 
   function sniffBytes(b, url) {
@@ -570,27 +582,31 @@
     return "unknown";
   }
 
-  function sniff(blob, url) {
-    return blob.slice(0, 8).arrayBuffer().then((buf) => sniffBytes(new Uint8Array(buf), url));
-  }
-
   async function loadImages(urls, referer) {
-    const out = [];
-    for (const u of urls) {
-      try {
-        const r = await gmRequest(u, {
-          responseType: "blob",
-          headers: referer ? { Referer: referer } : {},
-        });
-        const bytes = await blobToBytes(r.response);
-        const kind = await sniff(r.response, u);
-        const mime = kind === "png" ? "image/png" : "image/jpeg";
-        out.push({ url: u, bytes, mime, dataUrl: bytesToDataUrl(bytes, mime) });
-      } catch (e) {
-        log(`  图片失败 ${shortUrl(u)}: ${e.message}`);
+    const out = new Array(urls.length);
+    let cursor = 0;
+    // 4 路并发：几十页幻灯片时比串行快数倍，也不至于把 CDN 打出限流
+    const worker = async () => {
+      while (cursor < urls.length) {
+        if (state.cancelRequested) return;
+        const i = cursor++;
+        const u = urls[i];
+        try {
+          const r = await gmRequest(u, {
+            responseType: "blob",
+            headers: referer ? { Referer: referer } : {},
+          });
+          const bytes = await blobToBytes(r.response);
+          const kind = sniffBytes(bytes, u);
+          const mime = kind === "png" ? "image/png" : "image/jpeg";
+          out[i] = { url: u, bytes, mime };
+        } catch (e) {
+          log(`  图片失败 ${shortUrl(u)}: ${e.message}`);
+        }
       }
-    }
-    return out;
+    };
+    await Promise.all(Array.from({ length: Math.min(4, urls.length) }, worker));
+    return out.filter(Boolean);
   }
 
   async function buildPdf(pdfSources, imageSources) {
@@ -631,26 +647,43 @@
     pptx.title = title || "课件";
 
     for (const img of imageSources) {
+      const blob = new Blob([img.bytes], { type: img.mime || "image/jpeg" });
       const slide = pptx.addSlide();
       let w = 13.333, h = 7.5;
       try {
-        const dim = await imageSize(img.dataUrl);
+        const dim = await imageSize(blob);
         const scale = Math.min(w / dim.w, h / dim.h);
         w = dim.w * scale;
         h = dim.h * scale;
       } catch (e) { /* 用整版 */ }
-      slide.addImage({ data: img.dataUrl, x: (13.333 - w) / 2, y: (7.5 - h) / 2, w: w, h: h });
+      const dataUrl = await blobToDataUrl(blob);
+      slide.addImage({ data: dataUrl, x: (13.333 - w) / 2, y: (7.5 - h) / 2, w: w, h: h });
     }
     const buf = await pptx.write({ outputType: "arraybuffer" });
     return new Uint8Array(buf);
   }
 
-  function imageSize(dataUrl) {
+  async function imageSize(blob) {
+    if (typeof createImageBitmap === "function") {
+      try {
+        const bmp = await createImageBitmap(blob);
+        const dim = { w: bmp.width, h: bmp.height };
+        if (typeof bmp.close === "function") bmp.close();
+        return dim;
+      } catch (e) { /* 回退到 <img> 解码 */ }
+    }
     return new Promise((res, rej) => {
+      const url = URL.createObjectURL(blob);
       const im = new Image();
-      im.onload = () => res({ w: im.naturalWidth, h: im.naturalHeight });
-      im.onerror = rej;
-      im.src = dataUrl;
+      im.onload = () => {
+        URL.revokeObjectURL(url);
+        res({ w: im.naturalWidth, h: im.naturalHeight });
+      };
+      im.onerror = () => {
+        URL.revokeObjectURL(url);
+        rej(new Error("图片解码失败"));
+      };
+      im.src = url;
     });
   }
 
@@ -782,6 +815,7 @@
       const queue = ids.slice(0, limit);
       const worker = async () => {
         while (queue.length) {
+          if (state.cancelRequested) return;
           const lid = queue.shift();
           try {
             const r = await apiGet(`/lms/learn/leaf_info/${ctx.cid}/${lid}/`, { sign: ctx.sign });
@@ -793,6 +827,7 @@
           } catch (e) { /* 单个课时失败不影响整体 */ }
           done++;
           if (done % 5 === 0) log(`  课时详情 ${done}/${limit} …`);
+          if (opts.onProgress) opts.onProgress(done, limit, "读取课时详情 " + done + "/" + limit);
         }
       };
       const n = Math.min(4, limit);
@@ -1060,6 +1095,7 @@
   async function cxItemsFromAttachments(atts, chapterTitle) {
     const items = [];
     for (const att of atts) {
+      if (state.cancelRequested) break;
       let st = null;
       try {
         const txt = await cxText(
@@ -1355,6 +1391,7 @@
 
     const limit = opts.leafLimit > 0 ? Math.min(chapters.length, opts.leafLimit) : chapters.length;
     for (let i = 0; i < limit; i++) {
+      if (state.cancelRequested) { log("已取消扫描"); break; }
       const ch = chapters[i];
       try {
         const referer = buildUrl(CX.STUDY, {
@@ -1378,8 +1415,9 @@
       } catch (e) {
         log(`  [${i + 1}/${limit}] ${ch.title} 失败: ${e.message}`);
       }
+      if (opts.onProgress) opts.onProgress(i + 1, limit, `扫描章节 ${i + 1}/${limit}`);
       // 串行 + 间隔：超星会把多章节同时打开判为异常
-      if (i < limit - 1) await sleep(1000);
+      if (i < limit - 1 && !state.cancelRequested) await sleep(1000);
     }
 
     return Array.from(groups.values()).filter((g) => g.items.length);
@@ -1425,9 +1463,11 @@
     const pptFiles = [];
 
     for (const item of g.items) {
+      if (state.cancelRequested) return [];
       if (item.kind === "pages") {
         log(`  [${label}] 抓 ${item.pages.length} 页幻灯片 …`);
         const imgs = await loadImages(item.pages, item.referer);
+        if (state.cancelRequested) return [];
         imageSources.push(...imgs);
         continue;
       }
@@ -1436,6 +1476,7 @@
       const isDoc = (k) => k === "pdf" || k === "zip" || k === "ole" || k === "png" || k === "jpg";
       let done = false;
       for (const cand of cands) {
+        if (state.cancelRequested) return [];
         if (done) break;
         try {
           // 扫描阶段已经探过一次类型，能直接复用就不再重复请求
@@ -1473,7 +1514,6 @@
               imageSources.push({
                 url: cand, bytes,
                 mime: kind === "png" ? "image/png" : "image/jpeg",
-                dataUrl: bytesToDataUrl(bytes, kind === "png" ? "image/png" : "image/jpeg"),
               });
             }
             log(`  [${label}] ${item.fileName || "(无名)"} → ${kind}，已取回`);
@@ -1495,6 +1535,8 @@
         }
       }
     }
+
+    if (state.cancelRequested) return [];
 
     // 输出文件名：默认用章节名；章节名是「课件」这类占位词且这一课时只有一个文件时，
     // 改用原文件名（更贴近用户实际要找的东西）
@@ -1574,256 +1616,660 @@
   // 9. UI
   // =====================================================================
   if (typeof GM_addStyle === "function") GM_addStyle(`
-    #xtd-panel{position:fixed;right:16px;bottom:16px;width:330px;z-index:2147483000;
-      font:12px/1.6 -apple-system,"Microsoft YaHei",sans-serif;color:#e8ecf1;
-      background:#1c2128;border:1px solid #333c47;border-radius:10px;
-      box-shadow:0 8px 32px rgba(0,0,0,.45);overflow:hidden;}
+    #xtd-panel{
+      --xtd-bg:#0f172a;--xtd-surface:#16213a;--xtd-surface-2:#1e293b;
+      --xtd-border:#334155;--xtd-border-strong:#475569;
+      --xtd-text:#f8fafc;--xtd-text-2:#cbd5e1;--xtd-muted:#94a3b8;
+      --xtd-accent:#22c55e;--xtd-accent-hover:#16a34a;--xtd-on-accent:#052e16;
+      --xtd-ring:#38bdf8;--xtd-warn:#fbbf24;--xtd-danger:#f87171;--xtd-ok:#4ade80;
+      position:fixed;right:16px;bottom:16px;width:min(360px,calc(100vw - 24px));
+      z-index:2147483000;color:var(--xtd-text);background:var(--xtd-bg);
+      font:12.5px/1.55 -apple-system,BlinkMacSystemFont,"Segoe UI","Microsoft YaHei",sans-serif;
+      border:1px solid var(--xtd-border);border-radius:12px;overflow:hidden;isolation:isolate;
+      box-shadow:0 18px 40px rgba(2,6,23,.55),0 3px 10px rgba(2,6,23,.4);
+      color-scheme:dark;animation:xtd-in .2s ease-out}
+    @keyframes xtd-in{from{opacity:0;transform:translateY(8px)}to{opacity:1;transform:none}}
+    #xtd-panel *{box-sizing:border-box}
+    #xtd-panel [hidden]{display:none!important}
     #xtd-panel.collapsed .xtd-body{display:none}
-    #xtd-panel .xtd-head{display:flex;align-items:center;gap:8px;padding:9px 12px;
-      background:#242b34;border-bottom:1px solid #333c47;cursor:move;user-select:none}
-    #xtd-panel .xtd-head b{font-size:13px;flex:1}
-    #xtd-panel .xtd-head .xtd-toggle{opacity:.65;font-size:15px}
-    #xtd-panel .xtd-body{padding:10px 12px 12px;max-height:62vh;overflow:auto}
-    #xtd-panel .xtd-row{display:flex;gap:6px;flex-wrap:wrap;margin-bottom:8px}
-    #xtd-panel button{background:#2f6fd0;color:#fff;border:0;border-radius:5px;
-      padding:6px 11px;font-size:12px;cursor:pointer;font-family:inherit}
-    #xtd-panel button:hover{background:#3f83ea}
-    #xtd-panel button:disabled{background:#48505b;cursor:not-allowed}
-    #xtd-panel button.ghost{background:#3a424d}
-    #xtd-panel label{display:inline-flex;align-items:center;gap:4px;margin-right:8px;color:#b9c2cd}
-    #xtd-panel .xtd-ctx{color:#8b96a5;margin-bottom:8px;word-break:break-all}
-    #xtd-panel .xtd-list{font-size:11.5px;margin:6px 0;max-height:190px;overflow:auto;
-      border:1px solid #333c47;border-radius:6px;padding:6px;background:#171b20}
-    #xtd-panel .xtd-item{display:flex;gap:6px;align-items:flex-start;padding:3px 2px;border-bottom:1px solid #232a32}
+    #xtd-panel .xtd-head{display:flex;align-items:center;gap:8px;padding:8px 8px 8px 12px;
+      min-height:48px;background:var(--xtd-surface);border-bottom:1px solid var(--xtd-border);
+      cursor:grab;user-select:none;-webkit-user-select:none;touch-action:none}
+    #xtd-panel .xtd-head:active{cursor:grabbing}
+    #xtd-panel .xtd-dot{width:8px;height:8px;border-radius:50%;background:var(--xtd-accent);
+      box-shadow:0 0 0 3px rgba(34,197,94,.16);flex:none}
+    #xtd-panel .xtd-title{flex:1;font-size:13px;font-weight:600;letter-spacing:.01em;
+      white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+    #xtd-panel .xtd-ver{flex:none;font-size:11px;line-height:18px;color:var(--xtd-muted);
+      background:var(--xtd-bg);border:1px solid var(--xtd-border);border-radius:999px;
+      padding:0 7px;font-variant-numeric:tabular-nums}
+    #xtd-panel button{display:inline-flex;align-items:center;justify-content:center;gap:6px;
+      min-height:34px;padding:0 12px;border:1px solid transparent;border-radius:8px;
+      font:inherit;font-size:12.5px;font-weight:600;line-height:1;cursor:pointer;
+      transition:background-color .15s ease-out,border-color .15s ease-out,color .15s ease-out,opacity .15s ease-out}
+    #xtd-panel button:focus-visible,#xtd-panel summary:focus-visible{outline:2px solid var(--xtd-ring);outline-offset:2px}
+    #xtd-panel button:disabled{opacity:.45;cursor:not-allowed}
+    #xtd-panel button svg{width:16px;height:16px;flex:none}
+    #xtd-panel .xtd-icon-btn{width:32px;min-height:32px;padding:0;background:transparent;
+      border-color:transparent;color:var(--xtd-muted)}
+    #xtd-panel .xtd-icon-btn:hover{background:var(--xtd-surface-2);color:var(--xtd-text)}
+    #xtd-panel .xtd-icon-btn svg{width:18px;height:18px;transition:transform .18s ease-out}
+    #xtd-panel.collapsed .xtd-icon-btn svg{transform:rotate(180deg)}
+    #xtd-panel .xtd-primary{background:var(--xtd-accent);color:var(--xtd-on-accent)}
+    #xtd-panel .xtd-primary:hover:not(:disabled){background:var(--xtd-accent-hover)}
+    #xtd-panel .xtd-secondary{background:var(--xtd-surface-2);color:var(--xtd-text);border-color:var(--xtd-border)}
+    #xtd-panel .xtd-secondary:hover:not(:disabled){background:#273449;border-color:var(--xtd-border-strong)}
+    #xtd-panel .xtd-ghost{background:transparent;color:var(--xtd-text-2);border-color:var(--xtd-border)}
+    #xtd-panel .xtd-ghost:hover:not(:disabled){background:var(--xtd-surface-2);color:var(--xtd-text)}
+    #xtd-panel .xtd-body{padding:12px;max-height:min(70vh,640px);overflow:auto;overscroll-behavior:contain}
+    #xtd-panel .xtd-body::-webkit-scrollbar,#xtd-panel .xtd-list::-webkit-scrollbar,#xtd-panel .xtd-log::-webkit-scrollbar{width:10px;height:10px}
+    #xtd-panel .xtd-body::-webkit-scrollbar-thumb,#xtd-panel .xtd-list::-webkit-scrollbar-thumb,#xtd-panel .xtd-log::-webkit-scrollbar-thumb{background:var(--xtd-border-strong);border:3px solid var(--xtd-bg);border-radius:999px}
+    #xtd-panel .xtd-ctx{display:flex;flex-direction:column;gap:2px;padding:8px 10px;margin-bottom:10px;
+      font-size:12px;color:var(--xtd-muted);background:var(--xtd-surface);
+      border:1px solid var(--xtd-border);border-radius:8px}
+    #xtd-panel .xtd-ctx b{color:var(--xtd-text);font-weight:600}
+    #xtd-panel .xtd-ctx-line{overflow:hidden;white-space:nowrap;text-overflow:ellipsis}
+    #xtd-panel .xtd-ctx-line.xtd-ctx-hint{white-space:normal;overflow:visible;text-overflow:clip;line-height:1.5}
+    #xtd-panel .xtd-actions{display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-bottom:10px}
+    #xtd-panel .xtd-actions .xtd-span{grid-column:1 / -1}
+    #xtd-panel .xtd-opts,#xtd-panel .xtd-logbox{margin-bottom:10px;background:var(--xtd-surface);
+      border:1px solid var(--xtd-border);border-radius:8px}
+    #xtd-panel .xtd-logbox{overflow:hidden}
+    #xtd-panel summary{display:flex;align-items:center;gap:8px;min-height:34px;padding:0 10px;
+      color:var(--xtd-text-2);font-size:12px;font-weight:500;cursor:pointer;list-style:none;user-select:none}
+    #xtd-panel summary::-webkit-details-marker{display:none}
+    #xtd-panel summary svg{width:14px;height:14px;flex:none;color:var(--xtd-muted);transition:transform .18s ease-out}
+    #xtd-panel details[open] > summary svg{transform:rotate(90deg)}
+    #xtd-panel .xtd-opts-badge{flex:none;margin-left:auto;padding:1px 7px;border-radius:999px;
+      font-size:11px;font-weight:600;color:var(--xtd-on-accent);background:var(--xtd-accent)}
+    #xtd-panel .xtd-opts-body{display:flex;flex-direction:column;gap:8px;padding:2px 10px 10px}
+    #xtd-panel label{display:flex;align-items:center;gap:8px;min-height:24px;
+      font-size:12px;color:var(--xtd-text-2);cursor:pointer}
+    #xtd-panel label > span{flex:1}
+    #xtd-panel input[type=checkbox]{width:15px;height:15px;margin:0;flex:none;
+      accent-color:var(--xtd-accent);cursor:pointer}
+    #xtd-panel input[type=checkbox]:focus-visible{outline:2px solid var(--xtd-ring);outline-offset:2px}
+    #xtd-panel input[type=number]{width:56px;min-height:28px;padding:2px 6px;border-radius:6px;
+      font:inherit;font-size:12px;color:var(--xtd-text);background:var(--xtd-bg);
+      border:1px solid var(--xtd-border)}
+    #xtd-panel input[type=number]:focus-visible{outline:2px solid var(--xtd-ring);outline-offset:1px;border-color:transparent}
+    #xtd-panel label > span.xtd-limit-label{flex:none}
+    #xtd-panel label > span.xtd-limit-note{flex:none;margin-left:auto;font-size:11.5px;color:var(--xtd-muted)}
+    #xtd-panel .xtd-progress{margin-bottom:10px;padding:8px 10px;background:var(--xtd-surface);
+      border:1px solid var(--xtd-border);border-radius:8px}
+    #xtd-panel .xtd-progress-head{display:flex;align-items:center;gap:8px;margin-bottom:6px;
+      font-size:12px;color:var(--xtd-text-2)}
+    #xtd-panel .xtd-progress-label{flex:1;min-width:0;overflow:hidden;white-space:nowrap;text-overflow:ellipsis}
+    #xtd-panel .xtd-progress-time{flex:none;font-size:11.5px;color:var(--xtd-muted);font-variant-numeric:tabular-nums}
+    #xtd-panel .xtd-cancel{flex:none;min-height:24px;padding:0 9px;border-radius:999px;
+      font-size:11.5px;font-weight:500;color:var(--xtd-warn);background:transparent;border-color:var(--xtd-border)}
+    #xtd-panel .xtd-cancel:hover:not(:disabled){background:rgba(251,191,36,.12);border-color:var(--xtd-warn)}
+    #xtd-panel .xtd-progress-track{height:6px;border-radius:999px;overflow:hidden;background:var(--xtd-surface-2)}
+    #xtd-panel .xtd-progress-bar{width:100%;height:100%;border-radius:inherit;background:var(--xtd-accent);
+      transform:scaleX(0);transform-origin:left center;transition:transform .2s ease-out}
+    #xtd-panel .xtd-progress-bar.indeterminate{width:38%;transform:translateX(-100%);
+      animation:xtd-indeterminate 1.1s ease-in-out infinite}
+    @keyframes xtd-indeterminate{from{transform:translateX(-100%)}to{transform:translateX(320%)}}
+    #xtd-panel .xtd-tip{margin:0 0 10px;padding:8px 10px;border-radius:8px;font-size:12px;
+      color:var(--xtd-text-2);background:var(--xtd-surface);border:1px solid var(--xtd-border)}
+    #xtd-panel .xtd-tip-ok{color:var(--xtd-ok);border-color:rgba(74,222,128,.35)}
+    #xtd-panel .xtd-tip-warn{color:var(--xtd-warn);border-color:rgba(251,191,36,.35)}
+    #xtd-panel .xtd-tip-error{color:var(--xtd-danger);border-color:rgba(248,113,113,.35)}
+    #xtd-panel .xtd-results{display:none;margin-bottom:10px;background:var(--xtd-surface);
+      border:1px solid var(--xtd-border);border-radius:8px;overflow:hidden}
+    #xtd-panel .xtd-results.active{display:block}
+    #xtd-panel .xtd-results-head{display:flex;align-items:center;gap:8px;padding:6px 10px;
+      font-size:12px;color:var(--xtd-muted);border-bottom:1px solid var(--xtd-border)}
+    #xtd-panel .xtd-results-head label{flex:none;color:var(--xtd-text-2)}
+    #xtd-panel .xtd-results-title{flex:1;min-width:0;font-weight:500;color:var(--xtd-text-2)}
+    #xtd-panel .xtd-selected-count{flex:none;color:var(--xtd-muted);font-variant-numeric:tabular-nums}
+    #xtd-panel .xtd-list{max-height:clamp(132px,26vh,220px);overflow:auto;overscroll-behavior:contain}
+    #xtd-panel .xtd-item{display:flex;gap:9px;align-items:flex-start;padding:8px 10px;min-height:0;
+      border-bottom:1px solid rgba(51,65,85,.55);cursor:pointer;transition:background-color .12s ease-out}
+    #xtd-panel .xtd-item:hover{background:var(--xtd-surface-2)}
     #xtd-panel .xtd-item:last-child{border-bottom:0}
     #xtd-panel .xtd-item input{margin:3px 0 0}
-    #xtd-panel .xtd-item span{flex:1;word-break:break-all}
-    #xtd-panel .xtd-item em{font-style:normal;color:#7b8695;font-size:10.5px}
-    #xtd-panel .xtd-log{margin-top:8px;font-size:11px;color:#93a0b0;
-      background:#12161b;border:1px solid #2b333d;border-radius:6px;padding:6px;
-      max-height:150px;overflow:auto;white-space:pre-wrap;word-break:break-all}
-    #xtd-panel .xtd-tip{color:#d4a04a;margin:6px 0}
+    #xtd-panel .xtd-item-main{display:block;flex:1;min-width:0}
+    #xtd-panel .xtd-item-name{display:block;font-size:12.5px;color:var(--xtd-text);word-break:break-word}
+    #xtd-panel .xtd-item-meta{display:flex;flex-wrap:wrap;gap:4px 6px;margin-top:3px}
+    #xtd-panel .xtd-badge{max-width:100%;padding:0 6px;border-radius:999px;font-size:11px;line-height:16px;
+      color:var(--xtd-muted);background:var(--xtd-bg);border:1px solid var(--xtd-border);
+      overflow:hidden;white-space:nowrap;text-overflow:ellipsis}
+    #xtd-panel .xtd-empty{display:flex;flex-direction:column;align-items:center;gap:4px;
+      padding:20px 14px;font-size:12px;line-height:1.6;text-align:center;color:var(--xtd-muted)}
+    #xtd-panel .xtd-empty svg{width:28px;height:28px;margin-bottom:2px;opacity:.55}
+    #xtd-panel .xtd-empty b{font-size:12.5px;font-weight:600;color:var(--xtd-text-2)}
+    #xtd-panel .xtd-log{margin:0;padding:8px 10px;max-height:clamp(96px,20vh,160px);overflow:auto;
+      color:var(--xtd-muted);background:var(--xtd-bg);border-top:1px solid var(--xtd-border);
+      font:11.5px/1.65 ui-monospace,SFMono-Regular,Consolas,"Liberation Mono",monospace;
+      white-space:pre-wrap;word-break:break-all;overscroll-behavior:contain}
+    #xtd-panel .xtd-foot{display:flex;align-items:center;gap:10px;font-size:11.5px;color:var(--xtd-muted)}
+    #xtd-panel .xtd-foot-spacer{flex:1}
+    #xtd-panel .xtd-link{min-height:24px;padding:0;background:none;border:0;border-radius:0;
+      font-size:11.5px;font-weight:500;color:var(--xtd-muted);text-decoration:underline;text-underline-offset:2px}
+    #xtd-panel .xtd-link:hover{color:var(--xtd-text)}
+    @media (pointer:coarse){
+      #xtd-panel button{min-height:44px}
+      #xtd-panel .xtd-icon-btn{width:44px;min-height:44px}
+      #xtd-panel label{min-height:40px}
+    }
+    @media (prefers-reduced-motion:reduce){
+      #xtd-panel,#xtd-panel *{animation-duration:.001ms!important;animation-iteration-count:1!important;transition-duration:.001ms!important}
+    }
   `);
 
   let ui = {};
+  let logLines = [];
+  let logRaf = 0;
+  let busyTimer = 0;
+  let busyStart = 0;
+  const LOG_MAX_LINES = 300;
 
   function buildUI() {
     if ($("#xtd-panel")) return;
     const panel = document.createElement("div");
     panel.id = "xtd-panel";
+    panel.setAttribute("role", "region");
+    panel.setAttribute("aria-label", "课件抓取器面板");
     panel.innerHTML = `
-      <div class="xtd-head">
-        <b>课件抓取器</b>
-        <span class="xtd-toggle">▾</span>
+      <div class="xtd-head" title="拖动标题栏可移动面板">
+        <span class="xtd-dot" aria-hidden="true"></span>
+        <b class="xtd-title">课件抓取器</b>
+        <span class="xtd-ver" id="xtd-ver"></span>
+        <button type="button" class="xtd-icon-btn" id="xtd-collapse" aria-expanded="true" aria-controls="xtd-body" aria-label="收起面板" title="收起面板">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m6 9 6 6 6-6"/></svg>
+        </button>
       </div>
-      <div class="xtd-body">
-        <div class="xtd-ctx">正在识别课程…</div>
-        <div class="xtd-row">
-          <button id="xtd-scan">检测本页</button>
-          <button id="xtd-download" class="ghost" disabled>下载选中</button>
-          <button id="xtd-all" class="ghost">全部下载</button>
+      <div class="xtd-body" id="xtd-body">
+        <div class="xtd-ctx" id="xtd-ctx"><span class="xtd-ctx-line">正在识别课程…</span></div>
+        <div class="xtd-actions">
+          <button type="button" class="xtd-primary xtd-span" id="xtd-scan">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M3 7V5a2 2 0 0 1 2-2h2"/><path d="M17 3h2a2 2 0 0 1 2 2v2"/><path d="M21 17v2a2 2 0 0 1-2 2h-2"/><path d="M7 21H5a2 2 0 0 1-2-2v-2"/><path d="M3 12h18"/></svg>
+            <span id="xtd-scan-label">检测本页</span>
+          </button>
+          <button type="button" class="xtd-secondary" id="xtd-download" disabled>
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 3v12"/><path d="m7 10 5 5 5-5"/><path d="M5 21h14"/></svg>
+            下载选中
+          </button>
+          <button type="button" class="xtd-ghost" id="xtd-all" disabled>
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m12 2 9 5-9 5-9-5 9-5Z"/><path d="m3 12 9 5 9-5"/><path d="m3 17 9 5 9-5"/></svg>
+            全部下载
+          </button>
         </div>
-        <div class="xtd-row">
-          <label><input type="checkbox" id="xtd-all-ch">扫描整门课程</label>
-          <label><input type="checkbox" id="xtd-leaf" checked>含课时详情</label>
-          <label><input type="checkbox" id="xtd-pptx" checked>同时出 PPTX</label>
+        <details class="xtd-opts" id="xtd-opts">
+          <summary>
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m9 18 6-6-6-6"/></svg>
+            高级选项
+            <span class="xtd-opts-badge" id="xtd-opts-badge" hidden></span>
+          </summary>
+          <div class="xtd-opts-body">
+            <label><input type="checkbox" id="xtd-all-ch"><span>扫描整门课程（较慢，有风控风险）</span></label>
+            <label><input type="checkbox" id="xtd-leaf" checked><span>包含课时详情（学堂在线）</span></label>
+            <label><input type="checkbox" id="xtd-pptx" checked><span>同时导出 PPTX</span></label>
+            <label><input type="checkbox" id="xtd-pics" checked><span>收集本页正文图片</span></label>
+            <label class="xtd-limit-row"><span class="xtd-limit-label">课时上限</span><input type="number" id="xtd-limit" value="0" min="0" step="1" aria-label="课时上限"><span class="xtd-limit-note">0 = 不限</span></label>
+          </div>
+        </details>
+        <div class="xtd-progress" id="xtd-progress" hidden>
+          <div class="xtd-progress-head">
+            <span class="xtd-progress-label" id="xtd-progress-label">准备中…</span>
+            <span class="xtd-progress-time" id="xtd-progress-time"></span>
+            <button type="button" class="xtd-cancel" id="xtd-cancel" hidden>取消</button>
+          </div>
+          <div class="xtd-progress-track">
+            <div class="xtd-progress-bar" id="xtd-progress-bar" role="progressbar" aria-label="任务进度" aria-valuemin="0" aria-valuemax="100"></div>
+          </div>
         </div>
-        <div class="xtd-row">
-          <label><input type="checkbox" id="xtd-pics" checked>收集本页图片</label>
-          <label>课时上限 <input type="number" id="xtd-limit" value="0" style="width:52px"> (0=不限)</label>
+        <div class="xtd-tip" id="xtd-tip" role="status" aria-live="polite" hidden></div>
+        <div class="xtd-results" id="xtd-results">
+          <div class="xtd-results-head">
+            <label><input type="checkbox" id="xtd-selectall"><span>全选</span></label>
+            <span class="xtd-results-title">检测结果</span>
+            <span class="xtd-selected-count" id="xtd-selected-count">0/0</span>
+          </div>
+          <div class="xtd-list" id="xtd-list" role="group" aria-label="检测结果列表"></div>
         </div>
-        <div class="xtd-list" id="xtd-list"></div>
-        <div class="xtd-tip" id="xtd-tip"></div>
-        <div class="xtd-log" id="xtd-log"></div>
+        <details class="xtd-logbox" id="xtd-logbox">
+          <summary>
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m9 18 6-6-6-6"/></svg>
+            运行日志
+          </summary>
+          <pre class="xtd-log" id="xtd-log" aria-label="运行日志"></pre>
+        </details>
+        <div class="xtd-foot">
+          <button type="button" class="xtd-link" id="xtd-clear-log">清空日志</button>
+          <span class="xtd-foot-spacer"></span>
+          <button type="button" class="xtd-link" id="xtd-update">检查更新</button>
+        </div>
       </div>`;
     document.body.appendChild(panel);
 
-    // ---- 面板可拖动：按住标题栏拖，位置会记住；单击标题栏仍然折叠/展开 ----
-    const head = panel.querySelector(".xtd-head");
-    let dragging = false;
-    let moved = false;
-    let offX = 0;
-    let offY = 0;
-    let suppressClick = false;
+    const q = (sel) => panel.querySelector(sel);
+    ui = {
+      panel,
+      head: q(".xtd-head"),
+      collapse: q("#xtd-collapse"),
+      version: q("#xtd-ver"),
+      ctx: q("#xtd-ctx"),
+      scan: q("#xtd-scan"),
+      scanLabel: q("#xtd-scan-label"),
+      download: q("#xtd-download"),
+      all: q("#xtd-all"),
+      allCh: q("#xtd-all-ch"),
+      leaf: q("#xtd-leaf"),
+      pptx: q("#xtd-pptx"),
+      pics: q("#xtd-pics"),
+      limit: q("#xtd-limit"),
+      optsBadge: q("#xtd-opts-badge"),
+      progress: q("#xtd-progress"),
+      progressLabel: q("#xtd-progress-label"),
+      progressTime: q("#xtd-progress-time"),
+      progressBar: q("#xtd-progress-bar"),
+      cancel: q("#xtd-cancel"),
+      tip: q("#xtd-tip"),
+      results: q("#xtd-results"),
+      list: q("#xtd-list"),
+      selectAll: q("#xtd-selectall"),
+      selectedCount: q("#xtd-selected-count"),
+      logbox: q("#xtd-logbox"),
+      log: q("#xtd-log"),
+      clearLog: q("#xtd-clear-log"),
+      update: q("#xtd-update"),
+    };
+    ui.optInputs = [ui.allCh, ui.leaf, ui.pptx, ui.pics, ui.limit].filter(Boolean);
+    ui.version.textContent = "v" + SCRIPT_VERSION;
 
-    head.addEventListener("mousedown", (e) => {
-      if (e.button !== 0) return;
-      if (e.target.closest("button, a, input, label, select")) return;
+    setupDrag(panel, ui.head);
+    setupInteractions();
+    restorePanelState();
+  }
+
+  function setCollapsed(collapsed) {
+    ui.panel.classList.toggle("collapsed", collapsed);
+    ui.collapse.setAttribute("aria-expanded", String(!collapsed));
+    const label = collapsed ? "展开面板" : "收起面板";
+    ui.collapse.setAttribute("aria-label", label);
+    ui.collapse.title = label;
+    try { GM_setValue("panelCollapsed", collapsed); } catch (e) { /* 忽略 */ }
+  }
+
+  // 拖动用 Pointer Events + 指针捕获 + rAF：鼠标/触控通用，拖拽期间只改 transform
+  function setupDrag(panel, head) {
+    let drag = null;
+    let raf = 0;
+
+    head.addEventListener("pointerdown", (e) => {
+      if (e.button !== 0 || e.target.closest("button")) return;
       const rect = panel.getBoundingClientRect();
-      dragging = true;
-      moved = false;
-      offX = e.clientX - rect.left;
-      offY = e.clientY - rect.top;
+      drag = {
+        id: e.pointerId, sx: e.clientX, sy: e.clientY,
+        left: rect.left, top: rect.top, moved: false,
+        lastLeft: rect.left, lastTop: rect.top,
+      };
       panel.style.right = "auto";
       panel.style.bottom = "auto";
       panel.style.left = rect.left + "px";
       panel.style.top = rect.top + "px";
+      try { head.setPointerCapture(e.pointerId); } catch (err) { /* 忽略 */ }
       e.preventDefault();
     });
-    document.addEventListener("mousemove", (e) => {
-      if (!dragging) return;
-      const maxL = Math.max(0, window.innerWidth - panel.offsetWidth);
-      const maxT = Math.max(0, window.innerHeight - 40);
-      const left = Math.min(maxL, Math.max(0, e.clientX - offX));
-      const top = Math.min(maxT, Math.max(0, e.clientY - offY));
-      if (Math.abs(left - panel.offsetLeft) > 2 || Math.abs(top - panel.offsetTop) > 2) moved = true;
-      panel.style.left = left + "px";
-      panel.style.top = top + "px";
-    });
-    document.addEventListener("mouseup", () => {
-      if (!dragging) return;
-      dragging = false;
-      if (moved) {
-        suppressClick = true;
-        try {
-          GM_setValue("panelPos", { left: panel.offsetLeft, top: panel.offsetTop });
-        } catch (e) { /* 忽略 */ }
+
+    head.addEventListener("pointermove", (e) => {
+      if (!drag || e.pointerId !== drag.id) return;
+      const dx = e.clientX - drag.sx;
+      const dy = e.clientY - drag.sy;
+      if (!drag.moved && Math.abs(dx) + Math.abs(dy) < 4) return;
+      drag.moved = true;
+      const maxL = Math.max(0, window.innerWidth - panel.offsetWidth - 12);
+      const maxT = Math.max(0, window.innerHeight - panel.offsetHeight - 12);
+      drag.lastLeft = Math.min(maxL, Math.max(0, drag.left + dx));
+      drag.lastTop = Math.min(maxT, Math.max(0, drag.top + dy));
+      if (!raf) {
+        raf = requestAnimationFrame(() => {
+          raf = 0;
+          if (!drag) return;
+          panel.style.transform = `translate3d(${drag.lastLeft - drag.left}px, ${drag.lastTop - drag.top}px, 0)`;
+        });
       }
     });
 
-    // 恢复上次拖动的位置
-    const pos = GM_getValue("panelPos", null);
-    if (pos && typeof pos.left === "number" && typeof pos.top === "number") {
-      panel.style.right = "auto";
-      panel.style.bottom = "auto";
-      panel.style.left = pos.left + "px";
-      panel.style.top = pos.top + "px";
-    }
-
-    head.addEventListener("click", () => {
-      if (suppressClick) { suppressClick = false; return; }   // 刚才是拖动，不是点击
-      panel.classList.toggle("collapsed");
-      panel.querySelector(".xtd-toggle").textContent = panel.classList.contains("collapsed") ? "▸" : "▾";
-    });
-
-    ui = {
-      panel,
-      ctx: panel.querySelector(".xtd-ctx"),
-      scan: panel.querySelector("#xtd-scan"),
-      download: panel.querySelector("#xtd-download"),
-      all: panel.querySelector("#xtd-all"),
-      allCh: panel.querySelector("#xtd-all-ch"),
-      leaf: panel.querySelector("#xtd-leaf"),
-      pptx: panel.querySelector("#xtd-pptx"),
-      pics: panel.querySelector("#xtd-pics"),
-      limit: panel.querySelector("#xtd-limit"),
-      list: panel.querySelector("#xtd-list"),
-      tip: panel.querySelector("#xtd-tip"),
-      log: panel.querySelector("#xtd-log"),
+    const endDrag = () => {
+      if (!drag) return;
+      if (raf) { cancelAnimationFrame(raf); raf = 0; }
+      panel.style.transform = "";
+      if (drag.moved) {
+        panel.style.left = drag.lastLeft + "px";
+        panel.style.top = drag.lastTop + "px";
+        try {
+          GM_setValue("panelPos", { left: Math.round(drag.lastLeft), top: Math.round(drag.lastTop) });
+        } catch (e) { /* 忽略 */ }
+      }
+      drag = null;
     };
+    head.addEventListener("pointerup", endDrag);
+    head.addEventListener("pointercancel", endDrag);
 
+    // 换屏、展开选项、结果变多都会改变面板尺寸，统一拉回视口内，避免底部按钮被挤出屏幕
+    window.addEventListener("resize", () => clampPanelIntoView(panel));
+    try {
+      if (typeof ResizeObserver === "function") {
+        new ResizeObserver(() => clampPanelIntoView(panel)).observe(panel);
+      }
+    } catch (e) { /* 忽略 */ }
+  }
+
+  /** 拖动过（有内联 left）才需要钳制；默认 right/bottom 定位天然贴边 */
+  function clampPanelIntoView(panel) {
+    if (!panel.style.left) return;
+    const rect = panel.getBoundingClientRect();
+    const maxL = Math.max(0, window.innerWidth - rect.width - 12);
+    const maxT = Math.max(0, window.innerHeight - rect.height - 12);
+    const left = Math.min(maxL, Math.max(0, rect.left));
+    const top = Math.min(maxT, Math.max(0, rect.top));
+    if (left !== rect.left || top !== rect.top) {
+      panel.style.left = left + "px";
+      panel.style.top = top + "px";
+    }
+  }
+
+  function restorePanelState() {
+    const pos = GM_getValue("panelPos", null);
+    if (pos && Number.isFinite(pos.left) && Number.isFinite(pos.top)) {
+      const maxL = Math.max(0, window.innerWidth - ui.panel.offsetWidth - 12);
+      const maxT = Math.max(0, window.innerHeight - ui.panel.offsetHeight - 12);
+      ui.panel.style.right = "auto";
+      ui.panel.style.bottom = "auto";
+      ui.panel.style.left = Math.min(maxL, Math.max(0, pos.left)) + "px";
+      ui.panel.style.top = Math.min(maxT, Math.max(0, pos.top)) + "px";
+    }
+    let collapsed = false;
+    try { collapsed = GM_getValue("panelCollapsed", false) === true; } catch (e) { /* 忽略 */ }
+    setCollapsed(collapsed);
+    syncOptsBadge();
+  }
+
+  function setupInteractions() {
+    ui.collapse.addEventListener("click", () => setCollapsed(!ui.panel.classList.contains("collapsed")));
     ui.scan.addEventListener("click", doScan);
     ui.download.addEventListener("click", () => doDownload(false));
     ui.all.addEventListener("click", () => doDownload(true));
+    ui.cancel.addEventListener("click", requestCancel);
+    ui.clearLog.addEventListener("click", clearLog);
+    ui.update.addEventListener("click", checkForUpdate);
+    ui.allCh.addEventListener("change", syncOptsBadge);
+    ui.selectAll.addEventListener("change", () => {
+      if (ui.selectAll.checked) state.selected = new Set(state.groups.map((_, i) => i));
+      else state.selected.clear();
+      ui.list.querySelectorAll("input[data-gi]").forEach((cb) => { cb.checked = ui.selectAll.checked; });
+      updateSelectionUI();
+    });
+    ui.list.addEventListener("change", (e) => {
+      const cb = e.target && e.target.closest ? e.target.closest("input[data-gi]") : null;
+      if (!cb) return;
+      const i = Number(cb.dataset.gi);
+      if (cb.checked) state.selected.add(i);
+      else state.selected.delete(i);
+      updateSelectionUI();
+    });
   }
 
+  function syncOptsBadge() {
+    if (!ui.optsBadge || !ui.allCh) return;
+    const on = ui.allCh.checked;
+    ui.optsBadge.textContent = on ? "整门课程" : "";
+    ui.optsBadge.hidden = !on;
+  }
+
+  function setTip(text, kind) {
+    if (!ui.tip) return;
+    ui.tip.textContent = text || "";
+    ui.tip.className = "xtd-tip" + (kind ? " xtd-tip-" + kind : "");
+    ui.tip.hidden = !text;
+  }
+
+  function formatElapsed(ms) {
+    const s = Math.max(0, Math.floor(ms / 1000));
+    if (s < 60) return s + "s";
+    return Math.floor(s / 60) + "m" + String(s % 60).padStart(2, "0") + "s";
+  }
+
+  function setProgress(done, total, label) {
+    if (!ui.progressBar) return;
+    if (label) ui.progressLabel.textContent = label;
+    const ratio = total > 0 ? Math.min(1, Math.max(0, done / total)) : 0;
+    ui.progressBar.classList.toggle("indeterminate", !(total > 0));
+    if (total > 0) {
+      ui.progressBar.style.transform = "scaleX(" + ratio + ")";
+      ui.progressBar.setAttribute("aria-valuenow", String(Math.round(ratio * 100)));
+    } else {
+      ui.progressBar.style.transform = "";
+      ui.progressBar.removeAttribute("aria-valuenow");
+    }
+  }
+
+  function setBusy(running, label) {
+    state.running = running;
+    if (!ui.progress) return;
+    ui.progress.hidden = !running;
+    ui.cancel.hidden = !running;
+    if (running) {
+      state.cancelRequested = false;
+      ui.cancel.disabled = false;
+      ui.progressTime.textContent = "0s";
+      busyStart = Date.now();
+      clearInterval(busyTimer);
+      busyTimer = setInterval(() => {
+        if (ui.progressTime) ui.progressTime.textContent = formatElapsed(Date.now() - busyStart);
+      }, 1000);
+      setProgress(0, 0, label || "处理中…");
+    } else {
+      clearInterval(busyTimer);
+      busyTimer = 0;
+      ui.progressBar.classList.remove("indeterminate");
+      ui.progressBar.style.transform = "scaleX(0)";
+      ui.progressBar.removeAttribute("aria-valuenow");
+      ui.progressTime.textContent = "";
+      ui.scanLabel.textContent = "检测本页";
+    }
+    ui.optInputs.forEach((el) => { el.disabled = running; });
+    updateSelectionUI();
+  }
+
+  function updateSelectionUI() {
+    if (!ui.results) return;
+    const total = state.groups.length;
+    const count = state.selected.size;
+    ui.selectedCount.textContent = count + "/" + total;
+    ui.selectAll.checked = total > 0 && count === total;
+    ui.selectAll.indeterminate = count > 0 && count < total;
+    ui.selectAll.disabled = state.running || total === 0;
+    ui.scan.disabled = state.running || state.canScan === false;
+    ui.download.disabled = state.running || count === 0;
+    ui.all.disabled = state.running || total === 0;
+  }
+
+  function requestCancel() {
+    if (!state.running || state.cancelRequested) return;
+    state.cancelRequested = true;
+    ui.cancel.disabled = true;
+    setTip("正在取消…当前网络请求结束后会停下", "warn");
+    log("已请求取消");
+  }
+
+  // 日志：rAF 合帧 + 最多保留 300 行，长时间抓取不会无限涨内存
   function log(msg) {
     if (!ui.log) { console.log("[xtd]", msg); return; }
     const t = new Date().toLocaleTimeString("zh-CN", { hour12: false });
-    ui.log.textContent += `[${t}] ${msg}\n`;
-    ui.log.scrollTop = ui.log.scrollHeight;
+    logLines.push("[" + t + "] " + msg);
+    if (logLines.length > LOG_MAX_LINES) logLines.splice(0, logLines.length - LOG_MAX_LINES);
+    if (!logRaf) logRaf = requestAnimationFrame(flushLog);
+  }
+
+  function flushLog() {
+    logRaf = 0;
+    if (!ui.log) return;
+    const nearBottom = ui.log.scrollHeight - ui.log.scrollTop - ui.log.clientHeight < 24;
+    ui.log.textContent = logLines.join("\n");
+    if (nearBottom) ui.log.scrollTop = ui.log.scrollHeight;
+  }
+
+  function clearLog() {
+    logLines = [];
+    if (logRaf) { cancelAnimationFrame(logRaf); logRaf = 0; }
+    if (ui.log) ui.log.textContent = "";
   }
 
   function renderList() {
-    ui.list.innerHTML = "";
-    state.groups.forEach((g, gi) => {
-      const row = document.createElement("div");
-      row.className = "xtd-item";
-      const cb = document.createElement("input");
-      cb.type = "checkbox";
-      cb.checked = true;
-      cb.dataset.gi = gi;
-      const sp = document.createElement("span");
-      const sub = g.chapter && g.chapter !== g.name ? ` <em>${g.chapter}</em>` : "";
-      sp.innerHTML = `${g.name || "(无名)"}<em>${g.items.length} 个资源</em>${sub}`;
-      row.appendChild(cb);
-      row.appendChild(sp);
-      ui.list.appendChild(row);
-    });
-    ui.download.disabled = state.groups.length === 0;
+    if (!ui.list) return;
+    const frag = document.createDocumentFragment();
+    if (!state.groups.length) {
+      const empty = document.createElement("div");
+      empty.className = "xtd-empty";
+      empty.innerHTML =
+        '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M22 12h-6l-2 3h-4l-2-3H2"/><path d="M5.45 5.11 2 12v6a2 2 0 0 0 2 2h16a2 2 0 0 0 2-2v-6l-3.45-6.89A2 2 0 0 0 16.76 4H7.24a2 2 0 0 0-1.79 1.11z"/></svg>' +
+        "<b>" + (state.scanned ? "没有检测到 PPT / PDF" : "还没有检测结果") + "</b>" +
+        "<span>" + (state.scanned ? "这个范围可能只有视频或测验。" : "点「检测本页」开始扫描。") + "</span>";
+      frag.appendChild(empty);
+    } else {
+      state.groups.forEach((g, i) => {
+        const row = document.createElement("label");
+        row.className = "xtd-item";
+        const cb = document.createElement("input");
+        cb.type = "checkbox";
+        cb.checked = state.selected.has(i);
+        cb.dataset.gi = String(i);
+        const main = document.createElement("span");
+        main.className = "xtd-item-main";
+        const name = document.createElement("span");
+        name.className = "xtd-item-name";
+        name.textContent = g.name || g.chapter || "(无名章节)";
+        const meta = document.createElement("span");
+        meta.className = "xtd-item-meta";
+        const count = document.createElement("span");
+        count.className = "xtd-badge";
+        count.textContent = g.items.length + " 个资源";
+        meta.appendChild(count);
+        if (g.chapter && g.chapter !== g.name) {
+          const ch = document.createElement("span");
+          ch.className = "xtd-badge";
+          ch.textContent = g.chapter;
+          ch.title = g.chapter;
+          meta.appendChild(ch);
+        }
+        main.append(name, meta);
+        row.append(cb, main);
+        frag.appendChild(row);
+      });
+    }
+    ui.list.replaceChildren(frag);
+    updateSelectionUI();
   }
 
   async function doScan() {
     if (state.running) return;
-    state.running = true;
-    ui.scan.disabled = true;
-    ui.tip.textContent = "";
-    ui.list.innerHTML = "";
+    const ctx = state.ctx;
+    if (!ctxOk(ctx)) {
+      setTip("当前页面没有课程上下文，请在课程学习页使用。", "error");
+      log("没有识别到课程上下文");
+      return;
+    }
+    setTip("");
+    state.canScan = true;
+    setBusy(true, "正在检测…");
+    ui.scanLabel.textContent = "检测中…";
+    state.groups = [];
+    state.selected = new Set();
+    state.scanned = false;
+    ui.results.classList.remove("active");
+    renderList();
+    ui.logbox.open = true;
     log("— 开始扫描 —");
     try {
-      const ctx = state.ctx;
-      if (!ctxOk(ctx)) {
-        ui.tip.textContent = "当前页面没有课程上下文，请在课程学习页使用。";
-        log("没有识别到课程上下文");
-        return;
-      }
       const opts = {
         withLeaf: ui.leaf.checked,
         leafLimit: parseInt(ui.limit.value || "0", 10) || 0,
         makePptx: ui.pptx.checked,
         allChapters: !!(ui.allCh && ui.allCh.checked),
         pageImages: !!(ui.pics && ui.pics.checked),
+        onProgress: (done, total, label) => {
+          if (!state.cancelRequested) setProgress(done, total, label);
+        },
       };
       const groups = await collectAll(ctx, opts);
+      state.scanned = true;
       state.groups = groups;
+      state.selected = new Set(groups.map((_, i) => i));
+      ui.results.classList.add("active");
       renderList();
       // 目录树是异步渲染的，boot 时取不到章节名，这里补一次
-      if (SITE === "chaoxing" && !opts.allChapters && ctx.knowledgeid) {
-        const t = cxCurrentChapterTitle(ctx.knowledgeid);
-        if (t) ui.ctx.innerHTML = cxCtxHtml(ctx, t);
-      }
-      const scope = SITE === "chaoxing"
-        ? (opts.allChapters ? "全课程扫描完成" : "本页检测完成")
-        : "扫描完成";
-      log(`${scope}：${groups.length} 个章节含文档`);
-      if (!groups.length) {
-        ui.tip.textContent = SITE === "chaoxing"
-          ? (opts.allChapters
+      refreshCtx();
+      if (state.cancelRequested) {
+        log("扫描已取消");
+        setTip("已取消扫描" + (groups.length ? "，保留已发现的 " + groups.length + " 个章节" : ""), "warn");
+      } else {
+        const scope = SITE === "chaoxing"
+          ? (opts.allChapters ? "全课程扫描完成" : "本页检测完成")
+          : "扫描完成";
+        log(`${scope}：${groups.length} 个章节含文档`);
+        if (groups.length) {
+          setTip(`${scope}，共 ${groups.length} 个章节`, "ok");
+        } else if (SITE === "chaoxing") {
+          setTip(opts.allChapters
             ? "没扫到 PPT/PDF。这门课可能只有视频，没有讲义。"
-            : "本页没有 PPT/PDF。这个章节可能只有视频或测验。")
-          : "没扫到 PPT/PDF。可能该课程未上传讲义，或文档藏在其它接口。";
+            : "本页没有 PPT/PDF。这个章节可能只有视频或测验。", "warn");
+        } else {
+          setTip("没扫到 PPT/PDF。可能该课程未上传讲义，或文档藏在其它接口。", "warn");
+        }
       }
     } catch (e) {
       log("扫描出错: " + e.message);
-      ui.tip.textContent = "扫描出错: " + e.message;
+      setTip("扫描出错: " + e.message, "error");
     } finally {
-      state.running = false;
-      ui.scan.disabled = false;
+      setBusy(false);
     }
   }
 
   async function doDownload(all) {
     if (state.running) return;
-    const groups = all
-      ? state.groups
-      : state.groups.filter((_, i) => {
-          const cb = ui.list.querySelector(`input[data-gi="${i}"]`);
-          return cb && cb.checked;
-        });
-    if (!groups.length) { ui.tip.textContent = "没有选中任何章节"; return; }
+    if (!state.groups.length) {
+      setTip("先点「检测本页」扫描出可下载的资源。", "warn");
+      return;
+    }
+    const groups = all ? state.groups.slice() : state.groups.filter((_, i) => state.selected.has(i));
+    if (!groups.length) {
+      setTip("没有选中任何章节，先勾选或点「全选」。", "warn");
+      return;
+    }
 
-    state.running = true;
-    ui.all.disabled = true;
-    ui.download.disabled = true;
-    ui.tip.textContent = "";
+    setTip("");
+    setBusy(true, "准备下载…");
+    ui.logbox.open = true;
     const opts = { makePptx: ui.pptx.checked };
-    let n = 0;
+    let done = 0;
+    log(`— 开始下载 ${groups.length} 个章节 —`);
     try {
       for (const g of groups) {
-        ui.tip.textContent = `正在处理 ${g.name || g.chapter || "(无名)"} (${n + 1}/${groups.length})`;
+        if (state.cancelRequested) break;
+        const label = g.name || g.chapter || "(无名)";
+        setProgress(done, groups.length, `正在处理 ${label}（${done + 1}/${groups.length}）`);
         const made = await processGroup(g, opts);
-        n++;
-        if (!made.length) log(`  [${g.name || g.chapter}] 没有产出文件`);
+        done++;
+        if (state.cancelRequested) break;
+        if (!made.length) log(`  [${label}] 没有产出文件`);
+        setProgress(done, groups.length, "正在处理 " + label);
       }
-      ui.tip.textContent = `完成：处理 ${groups.length} 个章节`;
-      log("— 全部完成 —");
+      if (state.cancelRequested) {
+        log(`下载已取消，完成 ${done}/${groups.length}`);
+        setTip(`已取消：完成 ${done}/${groups.length} 个章节`, "warn");
+      } else {
+        setTip(`完成：处理 ${groups.length} 个章节`, "ok");
+        log("— 全部完成 —");
+      }
     } catch (e) {
       log("下载出错: " + e.message);
-      ui.tip.textContent = "出错: " + e.message;
+      setTip("出错: " + e.message, "error");
     } finally {
-      state.running = false;
-      ui.all.disabled = false;
-      ui.download.disabled = state.groups.length === 0;
+      setBusy(false);
     }
   }
 
@@ -1832,7 +2278,7 @@
   // =====================================================================
   const SCRIPT_NAME = "超星课件抓取器 · PPT/PDF/页面图片 合并导出";
   const SCRIPT_NS = "specdock.my-script.chaoxing-courseware";
-  const FALLBACK_VERSION = "1.0.1";
+  const FALLBACK_VERSION = "1.1.0";
   const SCRIPT_VERSION = (() => {
     try {
       return (typeof GM_info !== "undefined" && GM_info.script && GM_info.script.version) || FALLBACK_VERSION;
@@ -2034,17 +2480,19 @@
       const latest = await withDeadline(fetchLatestFromGitHub(), UPDATE.deadline);
       if (!latest || !latest.version || cmpVersion(latest.version, SCRIPT_VERSION) <= 0) {
         log("已是最新版本 v" + SCRIPT_VERSION);
-        alert("已是最新版本 v" + SCRIPT_VERSION);
+        setTip("已是最新版本 v" + SCRIPT_VERSION, "ok");
         return;
       }
       log(`发现新版本 v${latest.version}，正在打开安装页…`);
+      setTip(`发现新版本 v${latest.version}，正在打开安装页`, "ok");
       window.open(latest.url, "_blank", "noopener");
     } catch (e) {
       log("检查更新失败：" + (e && e.message ? e.message : e));
-      alert(
+      setTip(
         e && e.network
           ? "检查失败：网络异常或访问 GitHub 超时，请检查网络后重试。"
-          : "检查失败：未能获取版本信息，请稍后重试。"
+          : "检查失败：未能获取版本信息，请稍后重试。",
+        "error"
       );
     } finally {
       updateChecking = false;
@@ -2063,15 +2511,26 @@
 
   /** 面板顶部的上下文行（学习通） */
   function cxCtxHtml(ctx, curTitle) {
+    const chapter = curTitle || ctx.knowledgeid || "";
     const line1 =
-      `学习通 courseid=<b>${ctx.courseid}</b>` +
-      (curTitle
-        ? `  当前章节 <b>${curTitle}</b>`
-        : (ctx.knowledgeid ? `  当前章节 <b>${ctx.knowledgeid}</b>` : ""));
-    const line2 = curTitle
-      ? `默认只检测<b>本页</b>的 PPT/PDF；要抓整门课程请勾选「扫描整门课程」`
-      : `默认只检测<b>本页</b>的 PPT/PDF（当前章节目录尚未渲染，点「检测本页」即可）；要抓整门课程请勾选「扫描整门课程」`;
-    return `${line1}<br><span style="opacity:.72">${line2}</span>`;
+      '<span class="xtd-ctx-line">学习通 · courseid=<b>' + escapeHtml(ctx.courseid) + "</b>" +
+      (chapter ? " · 当前章节 <b>" + escapeHtml(chapter) + "</b>" : "") +
+      "</span>";
+    const hint = curTitle
+      ? "默认只检测本页的 PPT/PDF；要抓整门课程请展开「高级选项」勾选「扫描整门课程」。"
+      : "章节目录尚未渲染时，点「检测本页」即可；要抓整门课程请展开「高级选项」。";
+    return line1 + '<span class="xtd-ctx-line xtd-ctx-hint" style="opacity:.78">' + hint + "</span>";
+  }
+
+  /** 刷新上下文行：目录树是异步渲染的，扫描完成后再尝试补章节名 */
+  function refreshCtx() {
+    const ctx = state.ctx;
+    if (!ctx || !ui.ctx) return;
+    if (ctx.site === "chaoxing") {
+      const curTitle = ctx.knowledgeid ? cxCurrentChapterTitle(ctx.knowledgeid) : "";
+      ui.ctx.innerHTML = cxCtxHtml(ctx, curTitle);
+      ui.ctx.title = "courseid " + ctx.courseid + (curTitle ? " · " + curTitle : "");
+    }
   }
 
   function boot() {
@@ -2079,8 +2538,8 @@
     try {
       if (typeof GM_registerMenuCommand === "function") {
         GM_registerMenuCommand("检查更新", checkForUpdate);
-        GM_registerMenuCommand("重新收集本页图片", () => {
-          log("—— 重新收集本页图片 ——");
+        GM_registerMenuCommand("重新检测本页", () => {
+          log("—— 重新检测本页 ——");
           doScan();
         });
       }
@@ -2088,17 +2547,24 @@
     state.ctx = parseCtx();
     const ctx = state.ctx;
     if (ctx && ctx.site === "chaoxing") {
-      // 目录树是异步渲染的，boot 时可能还取不到章节名；扫描时会再取一次并刷新
-      const curTitle = ctx.knowledgeid ? cxCurrentChapterTitle(ctx.knowledgeid) : "";
-      ui.ctx.innerHTML = cxCtxHtml(ctx, curTitle);
+      state.canScan = true;
+      refreshCtx();
       log("已识别学习通课程上下文");
     } else if (ctx && ctx.cid) {
-      ui.ctx.innerHTML = `课程 sign=<b>${ctx.sign}</b> cid=<b>${ctx.cid}</b>` +
-        (ctx.leafId ? `  当前课时 <b>${ctx.leafId}</b> (${ctx.kind})` : "");
+      state.canScan = true;
+      ui.ctx.innerHTML =
+        '<span class="xtd-ctx-line">课程 sign=<b>' + escapeHtml(ctx.sign) + "</b> · cid=<b>" + escapeHtml(ctx.cid) + "</b></span>" +
+        (ctx.leafId
+          ? '<span class="xtd-ctx-line">当前课时 <b>' + escapeHtml(ctx.leafId) + "</b>（" + escapeHtml(ctx.kind) + "）</span>"
+          : "");
+      ui.ctx.title = "sign " + ctx.sign + " · cid " + ctx.cid;
       log("已识别课程上下文");
     } else {
-      ui.ctx.textContent = "当前页面未识别到课程（需要 cid）。可先打开课程学习页。";
-      ui.scan.disabled = true;
+      state.canScan = false;
+      ui.ctx.innerHTML =
+        '<span class="xtd-ctx-line">当前页面未识别到课程</span>' +
+        '<span class="xtd-ctx-line" style="opacity:.78">请先打开课程学习页（需要课程 ID）。</span>';
+      log("未识别到课程上下文");
     }
     // 记住上次选项
     const save = () => {
@@ -2108,7 +2574,7 @@
         pics: ui.pics ? ui.pics.checked : true,
       });
     };
-    [ui.leaf, ui.pptx, ui.limit].concat(ui.allCh ? [ui.allCh] : []).concat(ui.pics ? [ui.pics] : []).forEach((el) => el.addEventListener("change", save));
+    ui.optInputs.forEach((el) => el.addEventListener("change", save));
     const saved = GM_getValue("opts", null);
     if (saved) {
       ui.leaf.checked = saved.leaf !== false;
@@ -2117,16 +2583,18 @@
       if (ui.pics) ui.pics.checked = saved.pics !== false;     // 默认收集本页图片
       if (saved.limit) ui.limit.value = saved.limit;
     }
+    syncOptsBadge();
+    updateSelectionUI();
   }
 
-  // 调试钩子：直接调内部函数（页面图收集 / 高清地址换算 / 版本比较）
+  // 调试钩子：直接调内部函数（页面图收集 / 高清地址换算 / 版本比较 / 列表渲染）
   // 放在 IIFE 末尾赋值：上面的 const 声明这时已经完成初始化，避免 TDZ 报错
   if (typeof window !== "undefined") {
-    window.__XTD_DEBUG = { cxCollectPageImages, cxHiResUrl, cmpVersion, parseMeta, UPDATE };
+    window.__XTD_DEBUG = { cxCollectPageImages, cxHiResUrl, cmpVersion, parseMeta, UPDATE, renderList, refreshCtx };
   }
 
   if (typeof module !== "undefined" && module.exports) {
-    module.exports = { safeName, extOf, isImg, isDoc, resolveUrl, scanJson, collectLeafIds, groupNameOf, randomName, sniffBytes, buildLeafLabels, attachAttname, SITE, cxParseChapters, cxParseAttachments, cxResolveUrl, cxHiResUrl, ctxOk, buildUrl, cmpVersion, parseMeta, isSameScript, UPDATE };
+    module.exports = { safeName, escapeHtml, extOf, isImg, isDoc, resolveUrl, scanJson, collectLeafIds, groupNameOf, randomName, sniffBytes, buildLeafLabels, attachAttname, SITE, cxParseChapters, cxParseAttachments, cxResolveUrl, cxHiResUrl, ctxOk, buildUrl, cmpVersion, parseMeta, isSameScript, UPDATE };
   } else if (document.readyState === "loading") {
     document.addEventListener("DOMContentLoaded", boot);
   } else {
