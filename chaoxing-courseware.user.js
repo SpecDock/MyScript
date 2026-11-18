@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         超星课件抓取器 · PPT/PDF/页面图片 合并导出
 // @namespace    specdock.my-script.chaoxing-courseware
-// @version      1.1.1
+// @version      1.1.2
 // @description  在超星学习通（兼容学堂在线）课程页扫描各章节里的 PPT / PDF / 幻灯片，逐页抓取后合并成一个文件，按章节名保存到本地；学习通下可把当前页面正文里的图片收成一份高清 PDF。面板可拖动，菜单一键更新。
 // @author       specdock
 // @match        https://mooc1.chaoxing.com/mycourse/*
@@ -16,6 +16,7 @@
 // @grant        GM_getValue
 // @grant        GM_addStyle
 // @grant        GM_registerMenuCommand
+// @grant        GM_openInTab
 // @grant        GM_info
 // @connect      *
 // @connect      d0.cldisk.com
@@ -1860,7 +1861,7 @@
         <div class="xtd-foot">
           <button type="button" class="xtd-link" id="xtd-clear-log">清空日志</button>
           <span class="xtd-foot-spacer"></span>
-          <button type="button" class="xtd-link" id="xtd-update">检查更新</button>
+          <button type="button" class="xtd-link" id="xtd-update" title="打开篡改猴安装页（自动检查版本）">安装 / 更新</button>
         </div>
       </div>`;
     document.body.appendChild(panel);
@@ -2310,7 +2311,7 @@
   // =====================================================================
   const SCRIPT_NAME = "超星课件抓取器 · PPT/PDF/页面图片 合并导出";
   const SCRIPT_NS = "specdock.my-script.chaoxing-courseware";
-  const FALLBACK_VERSION = "1.1.1";
+  const FALLBACK_VERSION = "1.1.2";
   const SCRIPT_VERSION = (() => {
     try {
       return (typeof GM_info !== "undefined" && GM_info.script && GM_info.script.version) || FALLBACK_VERSION;
@@ -2324,6 +2325,8 @@
     repo: "SpecDock/MyScript",
     file: "chaoxing-courseware.user.js",
     branches: ["master", "main", "develop"],
+    // 安装页地址必须以 .user.js 结尾，篡改猴才会接管并弹出安装界面
+    installUrl: "https://raw.githubusercontent.com/SpecDock/MyScript/master/chaoxing-courseware.user.js",
     timeout: 6000,
     deadline: 10000,
   };
@@ -2501,7 +2504,35 @@
 
   let updateChecking = false;
 
+  /**
+   * 立即打开篡改猴安装页。
+   * 必须在点击事件里同步调用：await 之后再 window.open 会被浏览器当弹窗拦掉。
+   * GM_openInTab 最稳，降级顺序是 window.open → 当前页跳转。
+   */
+  function openInstallPage() {
+    const url = UPDATE.installUrl;
+    try {
+      if (typeof GM_openInTab === "function") {
+        GM_openInTab(url, { active: true, insert: true, setParent: true });
+        return url;
+      }
+    } catch (e) { /* 落到 window.open */ }
+    try {
+      const win = window.open(url, "_blank");
+      if (win) {
+        try { win.opener = null; } catch (e) { /* 读取跨域窗口属性可能被拒，忽略 */ }
+        return url;
+      }
+    } catch (e) { /* 落到同页跳转 */ }
+    try { location.href = url; } catch (e) { /* 完全打不开时只提示 */ }
+    return url;
+  }
+
   async function checkForUpdate() {
+    // 先同步打开安装页，保证一定弹出；版本检查只用于提示信息
+    const installUrl = openInstallPage();
+    log("已打开篡改猴安装页：" + installUrl);
+    setTip("已打开篡改猴安装页：有新版本会显示「更新」，同为最新可取消。", "ok");
     if (updateChecking) {
       log("正在检查更新…");
       return;
@@ -2512,18 +2543,17 @@
       const latest = await withDeadline(fetchLatestFromGitHub(), UPDATE.deadline);
       if (!latest || !latest.version || cmpVersion(latest.version, SCRIPT_VERSION) <= 0) {
         log("已是最新版本 v" + SCRIPT_VERSION);
-        setTip("已是最新版本 v" + SCRIPT_VERSION, "ok");
+        setTip("当前已是最新 v" + SCRIPT_VERSION + "，安装页里可重装或取消。", "ok");
         return;
       }
-      log(`发现新版本 v${latest.version}，正在打开安装页…`);
-      setTip(`发现新版本 v${latest.version}，正在打开安装页`, "ok");
-      window.open(latest.url, "_blank", "noopener");
+      log(`发现新版本 v${latest.version}（当前 v${SCRIPT_VERSION}），安装页已打开`);
+      setTip(`发现新版本 v${latest.version}（当前 v${SCRIPT_VERSION}），安装页已打开。`, "ok");
     } catch (e) {
       log("检查更新失败：" + (e && e.message ? e.message : e));
       setTip(
         e && e.network
-          ? "检查失败：网络异常或访问 GitHub 超时，请检查网络后重试。"
-          : "检查失败：未能获取版本信息，请稍后重试。",
+          ? "安装页已打开，但版本检查失败：网络异常或访问 GitHub 超时。"
+          : "安装页已打开，但未能获取版本信息，请稍后重试。",
         "error"
       );
     } finally {
@@ -2581,7 +2611,7 @@
     buildUI();
     try {
       if (typeof GM_registerMenuCommand === "function") {
-        GM_registerMenuCommand("检查更新", checkForUpdate);
+        GM_registerMenuCommand("安装 / 更新脚本", checkForUpdate);
         GM_registerMenuCommand("重新检测本页", () => {
           log("—— 重新检测本页 ——");
           doScan();
