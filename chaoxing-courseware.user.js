@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         超星课件抓取器 · PPT/PDF/页面图片 合并导出
 // @namespace    specdock.my-script.chaoxing-courseware
-// @version      1.1.0
+// @version      1.1.1
 // @description  在超星学习通（兼容学堂在线）课程页扫描各章节里的 PPT / PDF / 幻灯片，逐页抓取后合并成一个文件，按章节名保存到本地；学习通下可把当前页面正文里的图片收成一份高清 PDF。面板可拖动，菜单一键更新。
 // @author       specdock
 // @match        https://mooc1.chaoxing.com/mycourse/*
@@ -252,9 +252,11 @@
     // 超星学习通：/mycourse/studentstudy?chapterId=&courseId=&clazzid=&cpi=
     if (SITE === "chaoxing") {
       const q = new URLSearchParams(location.search);
+      // 新泛雅跳转过来的链接是 camelCase（courseId/clazzId），落地页是全小写，
+      // URLSearchParams 区分大小写，两种都要认
       const courseid = q.get("courseid") || q.get("courseId") || "";
-      const clazzid = q.get("clazzid") || q.get("classId") || "";
-      const knowledgeid = q.get("chapterId") || q.get("knowledgeid") || "";
+      const clazzid = q.get("clazzid") || q.get("clazzId") || q.get("classid") || q.get("classId") || "";
+      const knowledgeid = q.get("chapterId") || q.get("chapterid") || q.get("knowledgeid") || q.get("knowledgeId") || "";
       // clazzid 允许为空：部分页面没带，后面用 backclazzdata 反查补齐
       if (courseid) {
         return { site: "chaoxing", courseid, clazzid, knowledgeid, url: location.href };
@@ -949,7 +951,9 @@
         const tnode = item.querySelector(".clicktitle");
         const titleText = cleanText(tnode ? tnode.textContent : item.textContent);
         if (knowledgeid) {
-          out.push({ knowledgeid, title: titleAttr || titleText || "chapter_" + knowledgeid });
+          // 优先用目录里的 ".clicktitle"（带 1.1 / 2.3 之类的编号），
+          // title 属性只有章节名，整门扫描时容易多章同名、合并成一个文件
+          out.push({ knowledgeid, title: titleText || titleAttr || "chapter_" + knowledgeid });
         }
       });
     } catch (e) {
@@ -1686,9 +1690,26 @@
     #xtd-panel label{display:flex;align-items:center;gap:8px;min-height:24px;
       font-size:12px;color:var(--xtd-text-2);cursor:pointer}
     #xtd-panel label > span{flex:1}
-    #xtd-panel input[type=checkbox]{width:15px;height:15px;margin:0;flex:none;
-      accent-color:var(--xtd-accent);cursor:pointer}
-    #xtd-panel input[type=checkbox]:focus-visible{outline:2px solid var(--xtd-ring);outline-offset:2px}
+    /* 复选框自绘：学习通站点的全局样式会隐藏/重绘原生 checkbox，不能再依赖它 */
+    #xtd-panel input[type=checkbox]{position:absolute!important;width:1px!important;height:1px!important;
+      margin:0!important;padding:0!important;opacity:0!important;overflow:hidden!important;
+      clip:rect(0 0 0 0)!important;clip-path:inset(50%)!important;border:0!important;pointer-events:none;
+      display:block!important;visibility:visible!important}
+    #xtd-panel .xtd-box{flex:none!important;position:relative;display:inline-block;width:17px;height:17px;
+      border:1.5px solid var(--xtd-border-strong);border-radius:5px;background:var(--xtd-bg);
+      transition:background-color .12s ease-out,border-color .12s ease-out}
+    #xtd-panel .xtd-box::after{content:"";position:absolute;left:50%;top:50%;width:9px;height:5px;
+      border-left:2px solid var(--xtd-on-accent);border-bottom:2px solid var(--xtd-on-accent);
+      transform:translate(-50%,-62%) rotate(-45deg) scale(0);transform-origin:center;
+      transition:transform .12s ease-out}
+    #xtd-panel input[type=checkbox]:checked + .xtd-box,
+    #xtd-panel input[type=checkbox]:indeterminate + .xtd-box{background:var(--xtd-accent);border-color:var(--xtd-accent)}
+    #xtd-panel input[type=checkbox]:checked + .xtd-box::after{transform:translate(-50%,-62%) rotate(-45deg) scale(1)}
+    #xtd-panel input[type=checkbox]:indeterminate + .xtd-box::after{width:9px;height:0;border-left:0;
+      border-bottom:2px solid var(--xtd-on-accent);transform:translate(-50%,-50%)}
+    #xtd-panel input[type=checkbox]:focus-visible + .xtd-box{outline:2px solid var(--xtd-ring);outline-offset:2px}
+    #xtd-panel input[type=checkbox]:disabled + .xtd-box{opacity:.45}
+    #xtd-panel .xtd-item .xtd-box{margin-top:2px}
     #xtd-panel input[type=number]{width:56px;min-height:28px;padding:2px 6px;border-radius:6px;
       font:inherit;font-size:12px;color:var(--xtd-text);background:var(--xtd-bg);
       border:1px solid var(--xtd-border)}
@@ -1803,10 +1824,10 @@
             <span class="xtd-opts-badge" id="xtd-opts-badge" hidden></span>
           </summary>
           <div class="xtd-opts-body">
-            <label><input type="checkbox" id="xtd-all-ch"><span>扫描整门课程（较慢，有风控风险）</span></label>
-            <label><input type="checkbox" id="xtd-leaf" checked><span>包含课时详情（学堂在线）</span></label>
-            <label><input type="checkbox" id="xtd-pptx" checked><span>同时导出 PPTX</span></label>
-            <label><input type="checkbox" id="xtd-pics" checked><span>收集本页正文图片</span></label>
+            <label><input type="checkbox" id="xtd-all-ch"><span class="xtd-box" aria-hidden="true"></span><span>扫描整门课程（较慢，有风控风险）</span></label>
+            <label><input type="checkbox" id="xtd-leaf" checked><span class="xtd-box" aria-hidden="true"></span><span>包含课时详情（学堂在线）</span></label>
+            <label><input type="checkbox" id="xtd-pptx" checked><span class="xtd-box" aria-hidden="true"></span><span>同时导出 PPTX</span></label>
+            <label><input type="checkbox" id="xtd-pics" checked><span class="xtd-box" aria-hidden="true"></span><span>收集本页正文图片</span></label>
             <label class="xtd-limit-row"><span class="xtd-limit-label">课时上限</span><input type="number" id="xtd-limit" value="0" min="0" step="1" aria-label="课时上限"><span class="xtd-limit-note">0 = 不限</span></label>
           </div>
         </details>
@@ -1823,7 +1844,7 @@
         <div class="xtd-tip" id="xtd-tip" role="status" aria-live="polite" hidden></div>
         <div class="xtd-results" id="xtd-results">
           <div class="xtd-results-head">
-            <label><input type="checkbox" id="xtd-selectall"><span>全选</span></label>
+            <label><input type="checkbox" id="xtd-selectall"><span class="xtd-box" aria-hidden="true"></span><span>全选</span></label>
             <span class="xtd-results-title">检测结果</span>
             <span class="xtd-selected-count" id="xtd-selected-count">0/0</span>
           </div>
@@ -2069,7 +2090,7 @@
       ui.progressBar.style.transform = "scaleX(0)";
       ui.progressBar.removeAttribute("aria-valuenow");
       ui.progressTime.textContent = "";
-      ui.scanLabel.textContent = "检测本页";
+      ui.scanLabel.textContent = scanLabelText();
     }
     ui.optInputs.forEach((el) => { el.disabled = running; });
     updateSelectionUI();
@@ -2128,7 +2149,7 @@
       empty.innerHTML =
         '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M22 12h-6l-2 3h-4l-2-3H2"/><path d="M5.45 5.11 2 12v6a2 2 0 0 0 2 2h16a2 2 0 0 0 2-2v-6l-3.45-6.89A2 2 0 0 0 16.76 4H7.24a2 2 0 0 0-1.79 1.11z"/></svg>' +
         "<b>" + (state.scanned ? "没有检测到 PPT / PDF" : "还没有检测结果") + "</b>" +
-        "<span>" + (state.scanned ? "这个范围可能只有视频或测验。" : "点「检测本页」开始扫描。") + "</span>";
+        "<span>" + (state.scanned ? "这个范围可能只有视频或测验。" : "点「" + scanLabelText() + "」开始扫描。") + "</span>";
       frag.appendChild(empty);
     } else {
       state.groups.forEach((g, i) => {
@@ -2138,6 +2159,9 @@
         cb.type = "checkbox";
         cb.checked = state.selected.has(i);
         cb.dataset.gi = String(i);
+        const box = document.createElement("span");
+        box.className = "xtd-box";
+        box.setAttribute("aria-hidden", "true");
         const main = document.createElement("span");
         main.className = "xtd-item-main";
         const name = document.createElement("span");
@@ -2157,7 +2181,7 @@
           meta.appendChild(ch);
         }
         main.append(name, meta);
-        row.append(cb, main);
+        row.append(cb, box, main);
         frag.appendChild(row);
       });
     }
@@ -2175,6 +2199,13 @@
     }
     setTip("");
     state.canScan = true;
+    // 课程主页（/mycourse/stu 等）URL 里没有 chapterId，无法「只检测本页」，
+    // 这里强制走整门扫描，并同步勾选状态，保证按钮行为与选项一致
+    const courseHome = ctx.site === "chaoxing" && !ctx.knowledgeid;
+    if (courseHome && ui.allCh && !ui.allCh.checked) {
+      ui.allCh.checked = true;
+      syncOptsBadge();
+    }
     setBusy(true, "正在检测…");
     ui.scanLabel.textContent = "检测中…";
     state.groups = [];
@@ -2184,12 +2215,13 @@
     renderList();
     ui.logbox.open = true;
     log("— 开始扫描 —");
+    if (courseHome) log("当前是课程主页，没有选中章节，自动按「整门课程」扫描");
     try {
       const opts = {
         withLeaf: ui.leaf.checked,
         leafLimit: parseInt(ui.limit.value || "0", 10) || 0,
         makePptx: ui.pptx.checked,
-        allChapters: !!(ui.allCh && ui.allCh.checked),
+        allChapters: courseHome || !!(ui.allCh && ui.allCh.checked),
         pageImages: !!(ui.pics && ui.pics.checked),
         onProgress: (done, total, label) => {
           if (!state.cancelRequested) setProgress(done, total, label);
@@ -2232,7 +2264,7 @@
   async function doDownload(all) {
     if (state.running) return;
     if (!state.groups.length) {
-      setTip("先点「检测本页」扫描出可下载的资源。", "warn");
+      setTip("先点「" + scanLabelText() + "」扫描出可下载的资源。", "warn");
       return;
     }
     const groups = all ? state.groups.slice() : state.groups.filter((_, i) => state.selected.has(i));
@@ -2278,7 +2310,7 @@
   // =====================================================================
   const SCRIPT_NAME = "超星课件抓取器 · PPT/PDF/页面图片 合并导出";
   const SCRIPT_NS = "specdock.my-script.chaoxing-courseware";
-  const FALLBACK_VERSION = "1.1.0";
+  const FALLBACK_VERSION = "1.1.1";
   const SCRIPT_VERSION = (() => {
     try {
       return (typeof GM_info !== "undefined" && GM_info.script && GM_info.script.version) || FALLBACK_VERSION;
@@ -2516,10 +2548,16 @@
       '<span class="xtd-ctx-line">学习通 · courseid=<b>' + escapeHtml(ctx.courseid) + "</b>" +
       (chapter ? " · 当前章节 <b>" + escapeHtml(chapter) + "</b>" : "") +
       "</span>";
-    const hint = curTitle
+    const hint = ctx.knowledgeid
       ? "默认只检测本页的 PPT/PDF；要抓整门课程请展开「高级选项」勾选「扫描整门课程」。"
-      : "章节目录尚未渲染时，点「检测本页」即可；要抓整门课程请展开「高级选项」。";
+      : "当前是课程主页，只有整门扫描可用（已默认勾选）；想只抓一章，请先在左侧目录点开该章节。";
     return line1 + '<span class="xtd-ctx-line xtd-ctx-hint" style="opacity:.78">' + hint + "</span>";
+  }
+
+  /** 主按钮文案：课程主页没有 chapterId，「本页」无从检测，只能整门扫描 */
+  function scanLabelText() {
+    const ctx = state.ctx;
+    return ctx && ctx.site === "chaoxing" && !ctx.knowledgeid ? "检测整门课程" : "检测本页";
   }
 
   /** 刷新上下文行：目录树是异步渲染的，扫描完成后再尝试补章节名 */
@@ -2530,6 +2568,12 @@
       const curTitle = ctx.knowledgeid ? cxCurrentChapterTitle(ctx.knowledgeid) : "";
       ui.ctx.innerHTML = cxCtxHtml(ctx, curTitle);
       ui.ctx.title = "courseid " + ctx.courseid + (curTitle ? " · " + curTitle : "");
+      // 课程主页只能整门扫描：直接勾上并同步角标，避免用户以为没生效
+      if (!ctx.knowledgeid && ui.allCh && !ui.allCh.checked) {
+        ui.allCh.checked = true;
+        syncOptsBadge();
+      }
+      if (!state.running && ui.scanLabel) ui.scanLabel.textContent = scanLabelText();
     }
   }
 
@@ -2583,6 +2627,9 @@
       if (ui.pics) ui.pics.checked = saved.pics !== false;     // 默认收集本页图片
       if (saved.limit) ui.limit.value = saved.limit;
     }
+    // 课程主页没有章节可选，整门扫描是唯一有效动作（refreshCtx 里也会兜底同步）
+    if (ctx && ctx.site === "chaoxing" && !ctx.knowledgeid && ui.allCh) ui.allCh.checked = true;
+    if (ui.scanLabel) ui.scanLabel.textContent = scanLabelText();
     syncOptsBadge();
     updateSelectionUI();
   }
